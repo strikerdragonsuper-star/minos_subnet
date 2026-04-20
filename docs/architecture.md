@@ -98,20 +98,39 @@ Miners tune quality parameters via `configs/<tool>.conf`. Infrastructure paramet
 
 ## 5. Validator Loop
 
+Validators use **subset-based scoring** to scale across many miners. Instead of every validator scoring every miner (O(V×M)), the platform assigns each validator a primary miner range based on stake rank. Adjacent validators share a 20% overlap zone for integrity cross-checks.
+
 ```python
 while True:
-    rounds = get_scoring_rounds()          # poll platform for rounds in scoring phase
+    rounds = get_scoring_rounds()              # poll platform for rounds in scoring phase
     for round in rounds:
-        submissions = get_submissions(round)   # miner configs + presigned BAM/truth URLs
-        download_bam_and_truth(round)          # cached; skipped if SHA256 matches
-        for miner in submissions:
-            vcf = run_tool(miner.tool_config)  # reproduce miner's exact output
+        assignment = get_assignment(round)      # primary + secondary miner lists
+        submissions = get_submissions(round)    # miner configs + presigned BAM/truth URLs
+        download_bam_and_truth(round)           # cached; skipped if SHA256 matches
+
+        # Score primary miners first (no deadline pressure)
+        for miner in assignment.primary:
+            vcf = run_tool(miner.tool_config)
             metrics = score_with_happy(vcf, truth_vcf)
             score = compute_advanced_score(metrics)
             update_ema(miner.hotkey, score)
-        set_weights_on_chain()             # winner-takes-all by EMA
+
+        # Score secondary miners until 3 min before deadline
+        for miner in assignment.secondary:
+            if approaching_deadline():
+                break
+            # same scoring as above
+
+        # After scoring window closes: fetch peer scores for gap miners
+        backfill = get_backfill_scores(round)   # commit-then-reveal
+        for entry in backfill:
+            update_ema(entry.hotkey, entry.score)
+
+        set_weights_on_chain()                  # winner-takes-all by EMA
     sleep(query_interval)
 ```
+
+If the platform does not support assignments (e.g. single-validator testnet), the validator falls back to scoring all miners sequentially — identical to the pre-subset behavior.
 
 ### 5.1 Scoring formula
 
@@ -155,21 +174,25 @@ SNP/INDEL weighting is truth-count-proportional (fallback: 70/30).
 minos_subnet/
 ├── neurons/
 │   ├── miner.py           # Miner loop: poll, download, call variants, submit config
-│   ├── validator.py       # Validator loop: score submissions, set chain weights
-│   └── status.py          # Health checks and system status
+│   ├── validator.py       # Validator loop: subset scoring, set chain weights
+│   ├── status.py          # Health checks and system status
+│   └── README.md          # Neurons documentation
 ├── templates/
 │   ├── gatk.py            # GATK HaplotypeCaller template
 │   ├── deepvariant.py     # Google DeepVariant template
 │   ├── freebayes.py       # FreeBayes template
 │   ├── bcftools.py        # BCFtools mpileup/call template
+│   ├── _common.py         # Shared template utilities
 │   └── tool_params.py     # Parameter definitions and validation
 ├── utils/
 │   ├── scoring.py         # hap.py Docker runner + AdvancedScorer
 │   ├── weight_tracking.py # EMA score tracker + winner-takes-all weights
 │   ├── platform_client.py # Authenticated API client (miner + validator)
+│   ├── subset_scoring.py  # Subset scoring helpers (assignments, deadlines)
 │   ├── config_loader.py   # Tool config file parser
 │   ├── path_utils.py      # Safe filesystem paths
-│   └── file_utils.py      # SHA256-verified file download + caching
+│   ├── file_utils.py      # SHA256-verified file download + caching
+│   └── README.md          # Utils documentation
 ├── base/
 │   ├── genomics_config.py # Central config (Docker images, timeouts, EMA params)
 │   └── s3_manifest.json   # Reference data paths (local + S3)
@@ -178,8 +201,26 @@ minos_subnet/
 │   ├── deepvariant.conf   # Miner-tunable DeepVariant parameters
 │   ├── freebayes.conf     # Miner-tunable FreeBayes parameters
 │   └── bcftools.conf      # Miner-tunable BCFtools parameters
+├── docs/
+│   ├── architecture.md    # This document
+│   ├── tuning_guide.md    # Miner tuning reference (scoring, parameters, strategy)
+│   └── hap_py_docker.md   # hap.py Docker image reference
+├── scripts/
+│   ├── verify.sh          # Pre-flight environment check
+│   └── demo.sh            # End-to-end demo runner
+├── tests/                 # Unit and integration tests
+│   ├── conftest.py
+│   └── test_*.py          # Tests for scoring, config, platform client, etc.
 ├── install.sh             # Installer (full setup or update mode)
 ├── setup.py               # Interactive setup wizard
 ├── start-miner.sh         # Start miner (with inline wallet setup)
-└── start-validator.sh     # Start validator (with inline wallet setup)
+├── start-validator.sh     # Start validator (with inline wallet setup)
+├── pm2-miner.sh           # Start / restart miner under PM2
+├── pm2-validator.sh       # Start / restart validator under PM2
+├── ecosystem.miner.config.js     # PM2 config (miner)
+├── ecosystem.validator.config.js # PM2 config (validator)
+├── min_compute.yml        # Minimal compute requirements
+├── requirements.txt       # Python dependencies
+├── .env.miner.example     # Miner environment configuration
+└── .env.validator.example # Validator environment configuration
 ```

@@ -74,8 +74,8 @@ Minos (SN107) is a subnet for genomic variant calling and benchmarking powered b
 ```
 minos_subnet/
 ├── neurons/                  # Bittensor neuron entrypoints
-│   ├── validator.py          # Full validator orchestration
 │   ├── miner.py              # Miner loop: poll, download, call variants, submit config
+│   ├── validator.py          # Validator loop: subset scoring, set chain weights
 │   ├── status.py             # Health checks and system status
 │   └── README.md             # Neurons documentation
 ├── templates/                # Variant-calling tool templates
@@ -83,15 +83,19 @@ minos_subnet/
 │   ├── deepvariant.py        # Google DeepVariant template
 │   ├── freebayes.py          # FreeBayes template
 │   ├── bcftools.py           # BCFtools mpileup/call template
+│   ├── _common.py            # Shared template utilities
 │   └── tool_params.py        # Parameter definitions and validation
 ├── utils/                    # Genomics utility modules
-│   ├── scoring.py            # hap.py validation and scoring
-│   ├── weight_tracking.py    # EMA score tracking
-│   ├── file_utils.py         # File download and management
-│   ├── platform_client.py    # Platform API client for miners/validators
+│   ├── scoring.py            # hap.py Docker runner + AdvancedScorer
+│   ├── weight_tracking.py    # EMA score tracker + winner-takes-all weights
+│   ├── platform_client.py    # Authenticated API client (miner + validator)
+│   ├── subset_scoring.py     # Subset scoring helpers (assignments, deadlines)
+│   ├── config_loader.py      # Tool config file parser
+│   ├── path_utils.py         # Safe filesystem paths
+│   ├── file_utils.py         # SHA256-verified file download + caching
 │   └── README.md             # Utils documentation
 ├── base/                     # Core subnet config
-│   ├── genomics_config.py    # Genomics settings (Docker images, timeouts, EMA params)
+│   ├── genomics_config.py    # Central config (Docker images, timeouts, EMA params)
 │   └── s3_manifest.json      # Reference data paths (local + S3)
 ├── configs/                  # Miner-tunable quality parameters
 │   ├── gatk.conf
@@ -99,10 +103,15 @@ minos_subnet/
 │   ├── freebayes.conf
 │   └── bcftools.conf
 ├── docs/                     # Architecture and integration docs
-│   └── tuning_guide.md       # Miner tuning reference (scoring, parameters, strategy)
+│   ├── architecture.md       # System architecture deep dive
+│   ├── tuning_guide.md       # Miner tuning reference (scoring, parameters, strategy)
+│   └── hap_py_docker.md      # hap.py Docker image reference
 ├── scripts/                  # Developer tools
 │   ├── verify.sh             # Pre-flight environment check
 │   └── demo.sh               # End-to-end demo runner
+├── tests/                    # Unit and integration tests
+│   ├── conftest.py
+│   └── test_*.py             # Tests for scoring, config, platform client, etc.
 ├── install.sh                # Installer (full setup or update mode)
 ├── setup.py                  # Interactive setup wizard
 ├── start-miner.sh            # Start miner (with inline wallet setup)
@@ -111,6 +120,7 @@ minos_subnet/
 ├── pm2-validator.sh          # Start / restart validator under PM2 (wraps start-validator.sh)
 ├── ecosystem.miner.config.js # PM2 app config (miner)
 ├── ecosystem.validator.config.js # PM2 app config (validator)
+├── min_compute.yml           # Minimal compute requirements
 ├── requirements.txt          # Python dependencies
 ├── .env.miner.example        # Miner environment configuration
 ├── .env.validator.example    # Validator environment configuration

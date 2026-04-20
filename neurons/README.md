@@ -20,8 +20,9 @@ A miner receives genomic data (DNA sequencing files) and finds genetic variants 
 ### How It Works
 
 1. **Start Up**
+   - Docker availability is verified (fails fast with actionable error if missing)
    - Connect to the Bittensor network
-   - Register your hotkey to get a unique ID
+   - Register your hotkey to get a unique ID (or run in demo mode without registration)
    - Connect to the Minos Platform API to poll for available scoring rounds
 
 2. **Receive a Task**
@@ -102,13 +103,16 @@ A validator uses miners config file and selected hyperparameters to run the vari
    - Load reference genomic data
    - Connect to Minos Platform (authenticated via keypair signature)
 
-2. **Run and Score the Results**
+2. **Run and Score the Results** (subset-based scoring)
+   - Fetch scoring assignment from platform (primary miner range based on validator stake)
+   - Score primary miners first (no deadline pressure)
+   - Score secondary miners for gap coverage until 3 min before deadline
    - Re-run each miner's tool config locally (trustless verification)
    - Run hap.py to compare against known truth
    - Calculate quality scores for SNPs and INDELs
-   - Compute advanced score that will be used to assign the weights to the blockchain
 
-3. **Update Weights**
+3. **Backfill and Update Weights**
+   - After scoring window closes, fetch peer scores for miners not personally covered
    - Track scores with EMA (exponential moving average)
    - Winner-takes-all: best eligible miner gets 100% weight
    - Submit weights to Bittensor blockchain
@@ -235,7 +239,7 @@ Weights are assigned in two phases:
 ### Validator Needs
 
 - Reference genomic data (~9GB for chr1-chr22)
-- hap.py Docker image: `genonet/hap-py:0.3.15`
+- hap.py Docker image: `genonet/hap-py` (SHA256-pinned for reproducibility)
 - bcftools/samtools Docker images
 - 100GB+ storage for datasets and temporary files
 - 32GB+ RAM
@@ -258,8 +262,19 @@ Weights are assigned in two phases:
 | Platform 409 error | Round not in scoring phase | Check that the round is in the scoring window |
 | No miners available | Empty metagraph | Wait for miners to register |
 
+## Demo Mode
+
+The platform runs in **demo mode** before going live. In demo mode:
+- Registration is **not required** — anyone can test their setup
+- Variant calling runs normally on a sample BAM file
+- Submission is disabled (scores are not recorded)
+- A "DEMO COMPLETE" message confirms your system is ready
+
+Use `bash scripts/verify.sh --miner` to check prerequisites, or `bash scripts/demo.sh` to run a full end-to-end demo round.
+
 ## Learn More
 
+- [docs/tuning_guide.md](../docs/tuning_guide.md) — Parameter tuning, scoring breakdown, strategy
 - See `utils/` folder for genomics processing tools
 - See `base/` folder for configuration options
 - Check [main README](../README.md) for full documentation
