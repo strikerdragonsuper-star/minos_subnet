@@ -1107,6 +1107,21 @@ class Validator:
                 tracked_miners, submission_times
             )
 
+            # Apply burn split: scale miners to (1 - burn_rate), give burn the
+            # rest. Falls through to 100% burn if no miner has weight.
+            burn_rate = GENOMICS_CONFIG.get("burn_rate", 0.0) or 0.0
+            burn_hotkey = ""
+            if burn_rate > 0 and len(self.metagraph.hotkeys) > 0:
+                burn_hotkey = self.metagraph.hotkeys[0]
+                if sum(weights.values()) > 0:
+                    scale = 1.0 - burn_rate
+                    for hk in list(weights.keys()):
+                        weights[hk] *= scale
+                    weights[burn_hotkey] = burn_rate
+                else:
+                    weights[burn_hotkey] = 1.0
+                bt.logging.info(f"burn {burn_rate * 100:.0f}% -> uid 0 ({burn_hotkey[:12]}...)")
+
             # Log weight distribution (mode-aware)
             stats = self.score_tracker.get_stats()
             recipients = [hk for hk, w in weights.items() if w > 0]
@@ -1144,14 +1159,19 @@ class Validator:
                 bt.logging.info("Skipping on-chain set_weights — not registered (demo mode)")
                 return
 
-            # Map tracked miners to metagraph UIDs; drop any not on chain right now.
+            # Build hotkey -> uid map. Burn hotkey always passes (otherwise
+            # self-vote / validator filters strip it).
             hotkey_to_uid = {}
             for uid in range(len(self.metagraph.hotkeys)):
+                hk = self.metagraph.hotkeys[uid]
+                if hk == burn_hotkey:
+                    hotkey_to_uid[hk] = uid
+                    continue
                 if uid == self.my_subnet_uid:
                     continue
                 if self.metagraph.validator_permit[uid]:
                     continue
-                hotkey_to_uid[self.metagraph.hotkeys[uid]] = uid
+                hotkey_to_uid[hk] = uid
 
             chain_weights = {hk: w for hk, w in weights.items() if hk in hotkey_to_uid}
             if not chain_weights:
