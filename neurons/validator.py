@@ -1186,10 +1186,18 @@ class Validator:
 
             # Apply burn split: scale miners to (1 - burn_rate), give burn the
             # rest. Falls through to 100% burn if no miner has weight.
-            burn_rate = GENOMICS_CONFIG.get("burn_rate", 0.0) or 0.0
+            # burn_rate from platform if available, else BURN_RATE env.
+            network_cfg = await self.platform_client.get_network_config()
+            if network_cfg and "burn_rate" in network_cfg:
+                burn_rate = float(network_cfg["burn_rate"])
+                burn_uid = int(network_cfg.get("burn_uid", 0))
+            else:
+                burn_rate = float(GENOMICS_CONFIG.get("burn_rate", 0.9))
+                burn_uid = 0
+            burn_rate = max(0.0, min(1.0, burn_rate))
             burn_hotkey = ""
-            if burn_rate > 0 and len(self.metagraph.hotkeys) > 0:
-                burn_hotkey = self.metagraph.hotkeys[0]
+            if burn_rate > 0 and len(self.metagraph.hotkeys) > burn_uid:
+                burn_hotkey = self.metagraph.hotkeys[burn_uid]
                 if sum(weights.values()) > 0:
                     scale = 1.0 - burn_rate
                     for hk in list(weights.keys()):
@@ -1197,7 +1205,7 @@ class Validator:
                     weights[burn_hotkey] = burn_rate
                 else:
                     weights[burn_hotkey] = 1.0
-                bt.logging.info(f"burn {burn_rate * 100:.0f}% -> uid 0 ({burn_hotkey[:12]}...)")
+                bt.logging.info(f"burn {burn_rate * 100:.0f}% -> uid {burn_uid} ({burn_hotkey[:12]}...)")
 
             # Log weight distribution (mode-aware)
             stats = self.score_tracker.get_stats()
