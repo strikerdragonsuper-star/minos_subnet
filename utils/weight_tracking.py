@@ -377,14 +377,15 @@ class ScoreTracker:
                     winner = candidate
                     break
                 canonical_ema = self.ema_scores.get(candidate, 0.0)
-                if (top_ema - canonical_ema) <= CANONICAL_TIEBREAK_TOLERANCE:
+                gap = top_ema - canonical_ema
+                if gap <= CANONICAL_TIEBREAK_TOLERANCE + EMA_TOLERANCE:
                     winner = candidate
                     logger.info(
                         f"Canonical tiebreak: local rank-1 was "
                         f"{ranked[0][:16]}... (ema={top_ema:.4f}); "
                         f"deferring to canonical winner {candidate[:16]}... "
                         f"(ema={canonical_ema:.4f}, gap "
-                        f"{(top_ema - canonical_ema)*100:.2f}% within "
+                        f"{gap*100:.2f}% within "
                         f"{CANONICAL_TIEBREAK_TOLERANCE*100:.1f}% tolerance)"
                     )
                     break

@@ -398,6 +398,10 @@ class TestCanonicalTiebreak:
         _seed_eligible_emas(
             score_tracker, {"hk_a": 0.70, "hk_b": 0.70 - gap}
         )
+        actual_gap = (
+            score_tracker.ema_scores["hk_a"] - score_tracker.ema_scores["hk_b"]
+        )
+        assert actual_gap == pytest.approx(CANONICAL_TIEBREAK_TOLERANCE)
         weights = score_tracker.get_winner_heavy_pruning_dust_weights(
             ["hk_a", "hk_b"],
             canonical_top="hk_b",
@@ -457,6 +461,18 @@ class TestCanonicalTiebreak:
             **DEFAULT_REWARD_POLICY,
         )
         assert weights["hk_a"] == pytest.approx(DEFAULT_WINNER_WEIGHT)
+
+    def test_canonical_ranking_scans_past_out_of_band_candidate(self, score_tracker):
+        _seed_eligible_emas(
+            score_tracker,
+            {"hk_a": 0.700, "hk_b": 0.690, "hk_c": 0.650},
+        )
+        weights = score_tracker.get_winner_heavy_pruning_dust_weights(
+            ["hk_a", "hk_b", "hk_c"],
+            canonical_ranking=["hk_c", "hk_b", "hk_a"],
+            **DEFAULT_REWARD_POLICY,
+        )
+        assert weights["hk_b"] == pytest.approx(DEFAULT_WINNER_WEIGHT)
 
     def test_no_canonical_preserves_pure_function_baseline(self, score_tracker):
         # No canonical input preserves local EMA ranking.
