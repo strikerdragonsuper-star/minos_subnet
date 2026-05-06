@@ -11,6 +11,7 @@ from utils.weight_tracking import (
     DEFAULT_WINNER_WEIGHT,
     DEFAULT_DUST_TOP_N,
     DEFAULT_DUST_DECAY,
+    CANONICAL_TIEBREAK_TOLERANCE,
 )
 
 
@@ -51,6 +52,22 @@ def _make_active(tracker: ScoreTracker, hotkey: str, rounds: int = 1,
     for i in range(rounds):
         tracker.update(hotkey, score)
         tracker.record_round(f"active-{hotkey}-{i}", [hotkey])
+
+
+def _seed_eligible_emas(tracker: ScoreTracker, hotkey_emas: dict):
+    """Seed exact EMA values and eligibility for tolerance-boundary tests."""
+    hotkeys = list(hotkey_emas.keys())
+    for hk, ema in hotkey_emas.items():
+        tracker.ema_scores[hk] = ema
+
+    # Add participation history without changing the seeded EMA values.
+    for i in range(tracker.min_rounds):
+        tracker.round_history.append({
+            "round_id": f"seed-{i}",
+            "scored_hotkeys": list(hotkeys),
+            "active_hotkeys": list(hotkeys),
+        })
+    tracker._recalculate_participation()
 
 
 DEFAULT_REWARD_POLICY = {
@@ -336,6 +353,192 @@ class TestWinnerHeavyPruningDust:
         assert weights["hk_a"] == pytest.approx(miner_budget * 0.5 / 0.8)
         assert weights["hk_b"] == pytest.approx(miner_budget * 0.3 / 0.8)
         assert sum(weights.values()) == pytest.approx(miner_budget)
+
+
+# =========================================================================
+# TestCanonicalTiebreak
+# =========================================================================
+
+class TestCanonicalTiebreak:
+    """Canonical-ranking tiebreak when local leaders are within tolerance.
+
+    The canonical ranking comes from the platform's /scoring/canonical-ranking
+    endpoint. The validator scans it for the first locally eligible candidate
+    and uses that as a tiebreaker only inside the tolerance band.
+    """
+
+    def test_canonical_used_when_within_tolerance(self, score_tracker):
+        # Local rank-1 = hk_a (0.700 EMA), rank-2 = hk_b (0.695 EMA).
+        # Gap 0.5%, within 2% tolerance. Canonical says hk_b, so hk_b wins.
+        _seed_eligible_emas(score_tracker, {"hk_a": 0.700, "hk_b": 0.695})
+        weights = score_tracker.get_winner_heavy_pruning_dust_weights(
+            ["hk_a", "hk_b"],
+            canonical_top="hk_b",
+            **DEFAULT_REWARD_POLICY,
+        )
+        assert weights["hk_b"] == pytest.approx(DEFAULT_WINNER_WEIGHT)
+        dust_pool = 1.0 - DEFAULT_BURN_RATE - DEFAULT_WINNER_WEIGHT
+        assert weights["hk_a"] == pytest.approx(dust_pool)
+
+    def test_canonical_ignored_when_outside_tolerance(self, score_tracker):
+        # EMA gap is outside tolerance, so local rank 1 remains the winner.
+        _seed_eligible_emas(score_tracker, {"hk_a": 0.700, "hk_b": 0.640})
+        weights = score_tracker.get_winner_heavy_pruning_dust_weights(
+            ["hk_a", "hk_b"],
+            canonical_top="hk_b",
+            **DEFAULT_REWARD_POLICY,
+        )
+        assert weights["hk_a"] == pytest.approx(DEFAULT_WINNER_WEIGHT)
+        dust_pool = 1.0 - DEFAULT_BURN_RATE - DEFAULT_WINNER_WEIGHT
+        assert weights["hk_b"] == pytest.approx(dust_pool)
+
+    def test_canonical_at_exact_tolerance_boundary(self, score_tracker):
+        # Boundary is inclusive.
+        gap = CANONICAL_TIEBREAK_TOLERANCE
+        _seed_eligible_emas(
+            score_tracker, {"hk_a": 0.70, "hk_b": 0.70 - gap}
+        )
+        weights = score_tracker.get_winner_heavy_pruning_dust_weights(
+            ["hk_a", "hk_b"],
+            canonical_top="hk_b",
+            **DEFAULT_REWARD_POLICY,
+        )
+        assert weights["hk_b"] == pytest.approx(DEFAULT_WINNER_WEIGHT)
+
+    def test_canonical_just_outside_tolerance(self, score_tracker):
+        # Just outside the tolerance band, local rank 1 remains the winner.
+        gap = CANONICAL_TIEBREAK_TOLERANCE + 0.001
+        _seed_eligible_emas(
+            score_tracker, {"hk_a": 0.70, "hk_b": 0.70 - gap}
+        )
+        weights = score_tracker.get_winner_heavy_pruning_dust_weights(
+            ["hk_a", "hk_b"],
+            canonical_top="hk_b",
+            **DEFAULT_REWARD_POLICY,
+        )
+        assert weights["hk_a"] == pytest.approx(DEFAULT_WINNER_WEIGHT)
+
+    def test_canonical_lower_than_local_rank1_within_tolerance(self, score_tracker):
+        _seed_eligible_emas(
+            score_tracker, {"hk_a": 0.700, "hk_b": 0.715},
+        )
+        weights = score_tracker.get_winner_heavy_pruning_dust_weights(
+            ["hk_a", "hk_b"],
+            canonical_top="hk_a",
+            **DEFAULT_REWARD_POLICY,
+        )
+        assert weights["hk_a"] == pytest.approx(DEFAULT_WINNER_WEIGHT)
+
+    def test_canonical_not_in_eligible_set_falls_back(self, score_tracker):
+        # A canonical hotkey outside local eligibility cannot be used.
+        _seed_eligible_emas(score_tracker, {"hk_a": 0.700, "hk_b": 0.695})
+        weights = score_tracker.get_winner_heavy_pruning_dust_weights(
+            ["hk_a", "hk_b"],
+            canonical_top="hk_unknown_validator_in_some_other_subnet",
+            **DEFAULT_REWARD_POLICY,
+        )
+        assert weights["hk_a"] == pytest.approx(DEFAULT_WINNER_WEIGHT)
+
+    def test_canonical_ranking_skips_ineligible_rank1(self, score_tracker):
+        # Scan past canonical entries that are not locally eligible.
+        _seed_eligible_emas(score_tracker, {"hk_a": 0.700, "hk_b": 0.695})
+        weights = score_tracker.get_winner_heavy_pruning_dust_weights(
+            ["hk_a", "hk_b"],
+            canonical_ranking=["hk_new_not_eligible", "hk_b", "hk_a"],
+            **DEFAULT_REWARD_POLICY,
+        )
+        assert weights["hk_b"] == pytest.approx(DEFAULT_WINNER_WEIGHT)
+
+    def test_canonical_ranking_candidate_outside_tolerance_falls_back(self, score_tracker):
+        _seed_eligible_emas(score_tracker, {"hk_a": 0.700, "hk_b": 0.650})
+        weights = score_tracker.get_winner_heavy_pruning_dust_weights(
+            ["hk_a", "hk_b"],
+            canonical_ranking=["hk_new_not_eligible", "hk_b"],
+            **DEFAULT_REWARD_POLICY,
+        )
+        assert weights["hk_a"] == pytest.approx(DEFAULT_WINNER_WEIGHT)
+
+    def test_no_canonical_preserves_pure_function_baseline(self, score_tracker):
+        # No canonical input preserves local EMA ranking.
+        _seed_eligible_emas(score_tracker, {"hk_a": 0.700, "hk_b": 0.695})
+        weights = score_tracker.get_winner_heavy_pruning_dust_weights(
+            ["hk_a", "hk_b"],
+            canonical_top=None,
+            **DEFAULT_REWARD_POLICY,
+        )
+        assert weights["hk_a"] == pytest.approx(DEFAULT_WINNER_WEIGHT)
+
+    def test_no_canonical_matches_default_call(self, score_tracker):
+        # Explicit None and omitted canonical input should be equivalent.
+        _seed_eligible_emas(
+            score_tracker,
+            {"hk_a": 0.70, "hk_b": 0.69, "hk_c": 0.68, "hk_d": 0.67},
+        )
+        with_none = score_tracker.get_winner_heavy_pruning_dust_weights(
+            ["hk_a", "hk_b", "hk_c", "hk_d"],
+            canonical_top=None,
+            **DEFAULT_REWARD_POLICY,
+        )
+        without_kwarg = score_tracker.get_winner_heavy_pruning_dust_weights(
+            ["hk_a", "hk_b", "hk_c", "hk_d"],
+            **DEFAULT_REWARD_POLICY,
+        )
+        assert with_none == without_kwarg
+
+    def test_canonical_matches_local_rank1_is_noop(self, score_tracker):
+        _seed_eligible_emas(score_tracker, {"hk_a": 0.700, "hk_b": 0.695})
+        weights = score_tracker.get_winner_heavy_pruning_dust_weights(
+            ["hk_a", "hk_b"],
+            canonical_top="hk_a",
+            **DEFAULT_REWARD_POLICY,
+        )
+        assert weights["hk_a"] == pytest.approx(DEFAULT_WINNER_WEIGHT)
+
+    def test_dust_redistribution_after_canonical_override(self, score_tracker):
+        # Three eligible miners (all within tolerance), canonical promotes
+        # rank 2 to winner. The displaced local rank 1 keeps the top dust slot.
+        _seed_eligible_emas(
+            score_tracker,
+            {"hk_a": 0.700, "hk_b": 0.695, "hk_c": 0.690},
+        )
+        weights = score_tracker.get_winner_heavy_pruning_dust_weights(
+            ["hk_a", "hk_b", "hk_c"],
+            canonical_top="hk_b",
+            **DEFAULT_REWARD_POLICY,
+        )
+        assert weights["hk_b"] == pytest.approx(DEFAULT_WINNER_WEIGHT)
+        dust_pool = 1.0 - DEFAULT_BURN_RATE - DEFAULT_WINNER_WEIGHT
+        dust_total = 1.0 + DEFAULT_DUST_DECAY
+        assert weights["hk_a"] == pytest.approx(dust_pool / dust_total)
+        assert weights["hk_c"] == pytest.approx(
+            dust_pool * DEFAULT_DUST_DECAY / dust_total
+        )
+
+    def test_canonical_with_single_eligible_miner(self, score_tracker):
+        # A single locally eligible miner remains the winner.
+        _seed_eligible_emas(score_tracker, {"hk_a": 0.90})
+        weights = score_tracker.get_winner_heavy_pruning_dust_weights(
+            ["hk_a"],
+            canonical_top="hk_some_other",
+            **DEFAULT_REWARD_POLICY,
+        )
+        assert weights["hk_a"] == pytest.approx(DEFAULT_WINNER_WEIGHT)
+
+    def test_canonical_full_top10_dust_displaced_winner(self, score_tracker):
+        # Canonical rank 2 wins; local rank 1 remains first dust recipient.
+        emas = {f"hk_{i:02d}": 0.700 - i * 0.001 for i in range(1, 12)}
+        _seed_eligible_emas(score_tracker, emas)
+        miner_list = list(emas.keys())
+        weights = score_tracker.get_winner_heavy_pruning_dust_weights(
+            miner_list,
+            canonical_top="hk_02",
+            **DEFAULT_REWARD_POLICY,
+        )
+        non_zero = [hk for hk, w in weights.items() if w > 0]
+        assert len(non_zero) == 10, f"expected 10 non-zero, got {len(non_zero)}"
+        assert weights["hk_02"] == pytest.approx(DEFAULT_WINNER_WEIGHT)
+        assert weights["hk_11"] == 0
+        assert weights["hk_01"] > weights["hk_03"]
 
 
 # =========================================================================

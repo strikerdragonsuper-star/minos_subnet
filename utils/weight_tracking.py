@@ -43,6 +43,18 @@ WARMUP_WEIGHTS = [0.50, 0.30, 0.20]
 SCORE_EPSILON = 0.005
 EMA_TOLERANCE = 1e-9
 
+# Canonical-ranking tiebreak. When a locally eligible canonical candidate is
+# within this absolute EMA gap of local rank 1, the canonical candidate is used
+# as the winner. This keeps close rounds aligned while leaving clearly separated
+# local EMA winners unchanged.
+CANONICAL_TIEBREAK_TOLERANCE = 0.02
+
+# Minimum canonical coverage. Platform contributors below the per-validator
+# stake floor are excluded, and the validator requires enough distinct
+# validators before using the canonical ranking.
+CANONICAL_MIN_VALIDATOR_COUNT = int(os.getenv("CANONICAL_MIN_VALIDATOR_COUNT", "4"))
+CANONICAL_MIN_VALIDATOR_STAKE = float(os.getenv("CANONICAL_MIN_VALIDATOR_STAKE", "5000"))
+
 # Normal phase defaults. These are absolute validator-vector weights before
 # Bittensor's u16 encoding: burn gets 0.87, rank #1 gets 0.10, and ranks
 # #2-#10 split the remaining 0.03 by geometric decay.
@@ -245,6 +257,8 @@ class ScoreTracker:
         winner_weight: float,
         dust_top_n: int,
         dust_decay: float,
+        canonical_top: Optional[str] = None,
+        canonical_ranking: Optional[List[str]] = None,
     ) -> Dict[str, float]:
         """
         Compute absolute validator-vector miner weights.
@@ -254,6 +268,16 @@ class ScoreTracker:
         splits the remaining non-burn budget across ranks #2..dust_top_n.
         Unused dust is intentionally left unallocated so the caller can add it
         to burn.
+
+        If ``canonical_ranking`` is supplied, the validator scans it in order
+        and adopts the first locally eligible positive-EMA candidate within
+        ``CANONICAL_TIEBREAK_TOLERANCE`` of local rank 1. Local EMA order still
+        controls dust allocation.
+
+        ``canonical_top`` is retained as a backwards-compatible shorthand for
+        a one-item canonical ranking.
+
+        ``canonical_top=None`` keeps the default local-EMA ranking behavior.
         """
         weights = {hk: 0.0 for hk in miner_hotkeys}
         if not miner_hotkeys:
@@ -327,11 +351,51 @@ class ScoreTracker:
             )
             return weights
 
+        # Canonical-ranking tiebreak. Scan the ranking because the platform's
+        # top miner may not yet be locally eligible on every validator.
         winner = ranked[0]
+        canonical_candidates: List[str] = []
+        if canonical_ranking:
+            seen = set()
+            for hk in canonical_ranking:
+                if not isinstance(hk, str):
+                    continue
+                if not hk or hk in seen:
+                    continue
+                canonical_candidates.append(hk)
+                seen.add(hk)
+        elif canonical_top is not None:
+            canonical_candidates = [canonical_top]
+
+        if canonical_candidates:
+            ranked_set = set(ranked)
+            top_ema = self.ema_scores.get(ranked[0], 0.0)
+            for candidate in canonical_candidates:
+                if candidate not in ranked_set:
+                    continue
+                if candidate == ranked[0]:
+                    winner = candidate
+                    break
+                canonical_ema = self.ema_scores.get(candidate, 0.0)
+                if (top_ema - canonical_ema) <= CANONICAL_TIEBREAK_TOLERANCE:
+                    winner = candidate
+                    logger.info(
+                        f"Canonical tiebreak: local rank-1 was "
+                        f"{ranked[0][:16]}... (ema={top_ema:.4f}); "
+                        f"deferring to canonical winner {candidate[:16]}... "
+                        f"(ema={canonical_ema:.4f}, gap "
+                        f"{(top_ema - canonical_ema)*100:.2f}% within "
+                        f"{CANONICAL_TIEBREAK_TOLERANCE*100:.1f}% tolerance)"
+                    )
+                    break
+
         weights[winner] = winner_weight
 
         dust_pool = max(0.0, miner_budget - winner_weight)
-        dust_recipients = ranked[1:dust_top_n]
+        # Dust remains ordered by local EMA, excluding the chosen winner. If
+        # canonical selects a non-local-rank-1 winner, the displaced local
+        # rank 1 remains eligible for the highest dust slot.
+        dust_recipients = [hk for hk in ranked if hk != winner][:dust_top_n - 1]
         if dust_pool > 0 and dust_recipients:
             dust_raw = [dust_decay ** i for i in range(len(dust_recipients))]
             dust_total = sum(dust_raw)

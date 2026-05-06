@@ -8,6 +8,7 @@ environment setup, and process management.
 
 Usage:
     python setup.py          (after install.sh, or standalone if deps are installed)
+    python setup.py --update-data-only  (non-interactive data + image refresh)
     ./install.sh             (recommended: bootstraps deps then launches this)
 """
 
@@ -44,14 +45,20 @@ def _bootstrap_deps():
 
     if missing:
         print(f"\nSetup wizard requires: {', '.join(missing)}")
-        answer = input("Install now? [Y/n] ").strip().lower()
-        if answer in ("", "y", "yes"):
+        if "--update-data-only" in sys.argv:
+            print("Installing automatically for --update-data-only...")
             subprocess.check_call(
                 [sys.executable, "-m", "pip", "install", *missing, "--quiet"]
             )
         else:
-            print("Cannot proceed without dependencies. Exiting.")
-            sys.exit(1)
+            answer = input("Install now? [Y/n] ").strip().lower()
+            if answer in ("", "y", "yes"):
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", *missing, "--quiet"]
+                )
+            else:
+                print("Cannot proceed without dependencies. Exiting.")
+                sys.exit(1)
 
 _bootstrap_deps()
 
@@ -651,7 +658,7 @@ class SetupWizard:
 
     # ── Step 6: Docker images ─────────────────────────────────────────────
 
-    def step_docker_images(self) -> StepResult:
+    def step_docker_images(self, force_pull: bool = False, assume_yes: bool = False) -> StepResult:
         if self.state.role == "miner":
             # Pull all template images so the miner can switch tools without re-running setup.
             seen: set = set()
@@ -666,36 +673,53 @@ class SetupWizard:
 
         self.state.docker_images_needed = list(needed)
 
-        already = []
+        if shutil.which("docker") is None:
+            self.console.print("  [yellow]Docker is not installed; skipping image pull.[/]")
+            return StepResult(skipped=True)
+
+        existing = []
+        missing = []
         to_pull = []
         for image in needed:
             if self._docker_image_exists(image):
-                already.append(image)
+                existing.append(image)
+                if force_pull:
+                    to_pull.append(image)
             else:
+                missing.append(image)
                 to_pull.append(image)
 
         # Display table
         table = Table(show_header=True, header_style="bold cyan", padding=(0, 1))
         table.add_column("Image", style="white", max_width=55)
         table.add_column("Status", justify="center", width=10)
-        for img in already:
-            table.add_row(img, "[green]PULLED[/]")
-        for img in to_pull:
+        for img in existing:
+            status = "[cyan]REFRESH[/]" if force_pull else "[green]PULLED[/]"
+            table.add_row(img, status)
+        for img in missing:
             table.add_row(img, "[yellow]MISSING[/]")
         self.console.print(table)
 
-        self.state.docker_images_pulled = list(already)
+        self.state.docker_images_pulled = list(existing)
 
         if not to_pull:
             self.console.print("  [green]All required Docker images available.[/]")
             return StepResult()
 
-        self.console.print(f"  [dim]Total download may be several GB. This can take 5-15 minutes.[/]")
+        if force_pull:
+            self.console.print("  [dim]Refreshing configured Docker image references.[/]")
+        else:
+            self.console.print(f"  [dim]Total download may be several GB. This can take 5-15 minutes.[/]")
 
-        pull = questionary.confirm(
-            f"Pull {len(to_pull)} missing image(s)?",
-            default=True, style=CUSTOM_STYLE,
-        ).ask()
+        if assume_yes:
+            pull = True
+        else:
+            action = "Refresh" if force_pull else "Pull"
+            target = "configured image(s)" if force_pull else "missing image(s)"
+            pull = questionary.confirm(
+                f"{action} {len(to_pull)} {target}?",
+                default=True, style=CUSTOM_STYLE,
+            ).ask()
 
         if pull is None or not pull:
             self.console.print("  [yellow]Skipping. Pull images manually before running.[/]")
@@ -710,7 +734,8 @@ class SetupWizard:
             )
             if result.returncode == 0:
                 self.console.print(f"  [green]Pulled {img}[/]")
-                self.state.docker_images_pulled.append(img)
+                if img not in self.state.docker_images_pulled:
+                    self.state.docker_images_pulled.append(img)
             else:
                 self.console.print(f"  [red]Failed to pull {img}[/]")
                 failed.append(img)
@@ -809,7 +834,7 @@ class SetupWizard:
         self.console.print("  [green]Archive extracted[/]")
         return True
 
-    def step_reference_data(self) -> StepResult:
+    def step_reference_data(self, assume_yes: bool = False) -> StepResult:
         # Migrate old flat chr20 structure if detected
         self._migrate_legacy_reference_data()
 
@@ -849,10 +874,14 @@ class SetupWizard:
         total_size_mb = sum(f.get("size_mb", 0) for f in to_download)
         self.console.print(f"  [dim]Total download: ~{total_size_mb} MB[/]")
 
-        download = questionary.confirm(
-            f"Download {len(to_download)} missing file(s)?",
-            default=True, style=CUSTOM_STYLE,
-        ).ask()
+        if assume_yes:
+            self.console.print("  [dim]Downloading missing reference files without prompting.[/]")
+            download = True
+        else:
+            download = questionary.confirm(
+                f"Download {len(to_download)} missing file(s)?",
+                default=True, style=CUSTOM_STYLE,
+            ).ask()
 
         if download is None or not download:
             self.console.print("  [yellow]Skipping. Download files before running.[/]")
@@ -1566,10 +1595,7 @@ if __name__ == "__main__":
     wizard = SetupWizard()
 
     if "--update-data-only" in sys.argv:
-        # Non-interactive: just migrate legacy data + download missing reference files
-        print("\n  Checking reference data...\n")
-        wizard._migrate_legacy_reference_data()
-        # Determine role from .env if it exists
+        # Non-interactive: refresh configured Docker images and reference data.
         env_path = BASE_DIR / ".env"
         if env_path.exists():
             with open(env_path) as f:
@@ -1582,7 +1608,11 @@ if __name__ == "__main__":
                     wizard.state.role = "validator"
         else:
             wizard.state.role = "validator"  # download all (superset)
-        wizard.step_reference_data()
-        print("\n  Reference data up to date.\n")
+
+        print(f"\n  Updating {wizard.state.role} Docker images and reference data...\n")
+        wizard.step_docker_images(force_pull=True, assume_yes=True)
+        print("\n  Checking reference data...\n")
+        wizard.step_reference_data(assume_yes=True)
+        print("\n  Update-data-only finished.\n")
     else:
         wizard.run()
