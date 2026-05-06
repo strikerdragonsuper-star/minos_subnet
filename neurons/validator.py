@@ -1180,38 +1180,100 @@ class Validator:
                 bt.logging.info("No miners scored — skipping weight assignment")
                 return
 
-            weights = self.score_tracker.get_winner_takes_all_weights(
-                tracked_miners, submission_times
+            # Network reward params are authoritative. If the platform cannot
+            # provide a complete policy, fail closed instead of silently using
+            # stale local defaults.
+            network_cfg = await self.platform_client.get_network_config()
+            required_policy_fields = {
+                "burn_rate",
+                "burn_uid",
+                "winner_weight",
+                "dust_top_n",
+                "dust_decay",
+            }
+            if not network_cfg:
+                bt.logging.error(
+                    "Network reward config unavailable — skipping weight "
+                    "submission to avoid stale reward policy"
+                )
+                return
+            if not isinstance(network_cfg, dict):
+                bt.logging.error(
+                    f"Network reward config has invalid shape: {network_cfg!r} — "
+                    "skipping weight submission"
+                )
+                return
+            missing_policy_fields = sorted(required_policy_fields - set(network_cfg))
+            if missing_policy_fields:
+                bt.logging.error(
+                    "Network reward config missing required fields "
+                    f"{missing_policy_fields} — skipping weight submission"
+                )
+                return
+            try:
+                burn_rate = float(network_cfg["burn_rate"])
+                burn_uid = int(network_cfg["burn_uid"])
+                winner_weight = float(network_cfg["winner_weight"])
+                dust_top_n = int(network_cfg["dust_top_n"])
+                dust_decay = float(network_cfg["dust_decay"])
+            except (TypeError, ValueError) as exc:
+                bt.logging.error(
+                    f"Invalid network reward config {network_cfg}: {exc} — "
+                    "skipping weight submission"
+                )
+                return
+            miner_budget = 1.0 - burn_rate
+            if not 0.0 <= burn_rate <= 1.0:
+                bt.logging.error(f"Invalid burn_rate={burn_rate} — skipping weight submission")
+                return
+            if burn_uid < 0:
+                bt.logging.error(f"Invalid burn_uid={burn_uid} — skipping weight submission")
+                return
+            if not 0.0 <= winner_weight <= miner_budget:
+                bt.logging.error(
+                    f"Invalid winner_weight={winner_weight} for "
+                    f"miner_budget={miner_budget} — skipping weight submission"
+                )
+                return
+            if dust_top_n < 1:
+                bt.logging.error(f"Invalid dust_top_n={dust_top_n} — skipping weight submission")
+                return
+            if dust_decay < 0.0:
+                bt.logging.error(f"Invalid dust_decay={dust_decay} — skipping weight submission")
+                return
+
+            weights = self.score_tracker.get_winner_heavy_pruning_dust_weights(
+                tracked_miners,
+                submission_times,
+                burn_rate=burn_rate,
+                winner_weight=winner_weight,
+                dust_top_n=dust_top_n,
+                dust_decay=dust_decay,
             )
 
-            # Apply burn split: scale miners to (1 - burn_rate), give burn the
-            # rest. Falls through to 100% burn if no miner has weight.
-            # burn_rate from platform if available, else BURN_RATE env.
-            network_cfg = await self.platform_client.get_network_config()
-            if network_cfg and "burn_rate" in network_cfg:
-                burn_rate = float(network_cfg["burn_rate"])
-                burn_uid = int(network_cfg.get("burn_uid", 0))
-            else:
-                burn_rate = float(GENOMICS_CONFIG.get("burn_rate", 0.9))
-                burn_uid = 0
-            burn_rate = max(0.0, min(1.0, burn_rate))
             burn_hotkey = ""
-            if burn_rate > 0 and len(self.metagraph.hotkeys) > burn_uid:
+            burn_weight = max(0.0, 1.0 - sum(weights.values()))
+            if burn_weight > 1e-12 and len(self.metagraph.hotkeys) <= burn_uid:
+                bt.logging.error(
+                    f"Burn UID {burn_uid} unavailable in metagraph — skipping "
+                    "weight submission to avoid renormalizing miner weights"
+                )
+                return
+
+            if len(self.metagraph.hotkeys) > burn_uid:
                 burn_hotkey = self.metagraph.hotkeys[burn_uid]
-                if sum(weights.values()) > 0:
-                    scale = 1.0 - burn_rate
-                    for hk in list(weights.keys()):
-                        weights[hk] *= scale
-                    weights[burn_hotkey] = burn_rate
-                else:
-                    weights[burn_hotkey] = 1.0
-                bt.logging.info(f"burn {burn_rate * 100:.0f}% -> uid {burn_uid} ({burn_hotkey[:12]}...)")
+                weights[burn_hotkey] = weights.get(burn_hotkey, 0.0) + burn_weight
+                bt.logging.info(
+                    f"burn {burn_weight * 100:.2f}% -> uid {burn_uid} "
+                    f"({burn_hotkey[:12]}...), winner={winner_weight:.4f}, "
+                    f"dust_top_n={dust_top_n}, dust_decay={dust_decay:.2f}"
+                )
 
             # Log weight distribution (mode-aware)
             stats = self.score_tracker.get_stats()
             recipients = [hk for hk, w in weights.items() if w > 0]
             is_warmup = stats['eligible_count'] == 0
-            mode_label = "warmup split" if is_warmup else "winner-takes-all"
+            mode_label = "warmup split" if is_warmup else "winner-heavy + pruning dust"
             print(f"\n   Weight distribution ({mode_label}):", flush=True)
             print(f"   Eligible: {stats['eligible_count']}/{len(tracked_miners)} miners "
                   f"(need {stats['min_rounds_required']} rounds)", flush=True)
@@ -1219,7 +1281,7 @@ class Validator:
                 for r_hk in recipients:
                     r_w = weights[r_hk]
                     r_ema = self.score_tracker.ema_scores.get(r_hk, 0)
-                    print(f"   {r_hk[:16]}... EMA={r_ema:.4f} weight={r_w:.2f}", flush=True)
+                    print(f"   {r_hk[:16]}... EMA={r_ema:.4f} weight={r_w:.6f}", flush=True)
             else:
                 print(f"   No recipients — weights submission skipped (fail-closed)", flush=True)
 
@@ -1274,8 +1336,8 @@ class Validator:
         """Set weights on the blockchain.
 
         Args:
-            weights_by_hotkey: Dict of {hotkey: weight} from ScoreTracker.
-                              If None, computes weights from current EMA scores.
+            weights_by_hotkey: Dict of {hotkey: weight} from the validator
+                              weight policy. Required.
             hotkey_to_uid: Dict of {hotkey: uid} mapping.
                           If None, builds from metagraph.
             retry_count: Number of retry attempts.
@@ -1296,9 +1358,12 @@ class Validator:
             else:
                 miner_hotkeys = list(hotkey_to_uid.keys())
 
-            # Compute weights if not provided
             if weights_by_hotkey is None:
-                weights_by_hotkey = self.score_tracker.get_winner_takes_all_weights(miner_hotkeys)
+                bt.logging.error(
+                    "No explicit weights supplied to set_weights — skipping "
+                    "rather than computing a legacy policy"
+                )
+                return False
 
             if not miner_hotkeys:
                 bt.logging.warning("No miners found to set weights on")
@@ -1312,11 +1377,10 @@ class Validator:
                 miner_uids.append(uid)
                 miner_weights.append(weights_by_hotkey.get(hk, 0.0))
 
-            # Re-normalize to sum to 1 (safety check)
+            # Validate exact policy vector. Do not silently renormalize a
+            # partial vector because that changes burn/winner/dust ratios.
             total = sum(miner_weights)
-            if total > 0:
-                miner_weights = [w / total for w in miner_weights]
-            else:
+            if total <= 0:
                 # Fail closed — never silently distribute equal weights.
                 # Zero-sum weights indicate a scoring failure or no eligible miners
                 # with positive EMA. Submitting equal weights would leak emissions.
@@ -1326,6 +1390,13 @@ class Validator:
                     "This may indicate a scoring failure or all miners having zero EMA."
                 )
                 return False
+            if abs(total - 1.0) > 1e-6:
+                bt.logging.error(
+                    f"WEIGHT SAFETY: explicit weights sum to {total:.8f}, "
+                    "expected 1.0 — skipping rather than renormalizing"
+                )
+                return False
+            miner_weights = [w / total for w in miner_weights]
 
             # CRITICAL: Use numpy arrays, NOT torch tensors!
             uids_array = np.array(miner_uids, dtype=np.int64)

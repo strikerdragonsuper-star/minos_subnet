@@ -6,8 +6,9 @@ Weight distribution has two phases:
 
 - Warmup (before any miner reaches min_rounds): positional reward split
   50/30/20 among the top 3 scoring active miners (>= 1 round) by EMA.
-- Normal (once any miner is eligible): winner-takes-all — the single
-  top-performing eligible miner receives 100% of the weight.
+- Normal (once any miner is eligible): winner-heavy — the single
+  top-performing eligible miner receives the main reward, with pruning dust
+  distributed to the next ranked eligible miners.
 
 Eligibility requires scoring in at least `min_rounds` of the recent window.
 Tiebreaker: earliest submission timestamp in the most recent round.
@@ -40,6 +41,15 @@ WARMUP_WEIGHTS = [0.50, 0.30, 0.20]
 
 # Scores within this epsilon are treated as tied; tiebreak by submission time.
 SCORE_EPSILON = 0.005
+EMA_TOLERANCE = 1e-9
+
+# Normal phase defaults. These are absolute validator-vector weights before
+# Bittensor's u16 encoding: burn gets 0.87, rank #1 gets 0.10, and ranks
+# #2-#10 split the remaining 0.03 by geometric decay.
+DEFAULT_BURN_RATE = 0.87
+DEFAULT_WINNER_WEIGHT = 0.10
+DEFAULT_DUST_TOP_N = 10
+DEFAULT_DUST_DECAY = 0.80
 
 
 class ScoreTracker:
@@ -208,138 +218,132 @@ class ScoreTracker:
         """Check if a miner meets the minimum participation requirement."""
         return self.get_participation_count(hotkey) >= self.min_rounds
 
-    def get_winner_takes_all_weights(
+    def _sort_by_ema(
+        self,
+        hotkeys: List[str],
+        submission_times: Optional[Dict[str, float]] = None,
+        tolerance: float = EMA_TOLERANCE,
+    ) -> List[str]:
+        """Sort hotkeys by EMA descending, tiebreaking by earliest submission."""
+        def _cmp(hk_a, hk_b):
+            sa = self.ema_scores.get(hk_a, 0.0)
+            sb = self.ema_scores.get(hk_b, 0.0)
+            ta = submission_times.get(hk_a, float("inf")) if submission_times else float("inf")
+            tb = submission_times.get(hk_b, float("inf")) if submission_times else float("inf")
+            if abs(sa - sb) <= tolerance:
+                return -1 if ta < tb else (1 if ta > tb else 0)
+            return -1 if sa > sb else 1
+
+        return sorted(hotkeys, key=functools.cmp_to_key(_cmp))
+
+    def get_winner_heavy_pruning_dust_weights(
         self,
         miner_hotkeys: List[str],
         submission_times: Optional[Dict[str, float]] = None,
+        *,
+        burn_rate: float,
+        winner_weight: float,
+        dust_top_n: int,
+        dust_decay: float,
     ) -> Dict[str, float]:
         """
-        Compute weight distribution.
+        Compute absolute validator-vector miner weights.
 
-        Two modes:
-        - **Warmup** (no miner has min_rounds yet): positional split
-          (50/30/20) among top active miners by EMA score.
-          Inactive miners (0 rounds) get zero weight.
-        - **Normal**: winner-takes-all — single top eligible miner gets 100%.
-
-        Tiebreak in both modes: earliest submission timestamp.
-
-        Args:
-            miner_hotkeys: List of all miner hotkeys to consider.
-            submission_times: Optional dict of {hotkey: submitted_at_epoch}
-                              for tiebreaking. Typically from the most recent
-                              round's submission timestamps.
-
-        Returns:
-            Dict of {hotkey: weight} for all miners in miner_hotkeys.
+        Warmup keeps the existing 50/30/20 active-miner split, scaled to the
+        non-burn budget. Normal mode keeps rank #1 at ``winner_weight`` and
+        splits the remaining non-burn budget across ranks #2..dust_top_n.
+        Unused dust is intentionally left unallocated so the caller can add it
+        to burn.
         """
         weights = {hk: 0.0 for hk in miner_hotkeys}
+        if not miner_hotkeys:
+            return weights
 
-        # Find eligible miners
+        burn_rate = float(burn_rate)
+        winner_weight = float(winner_weight)
+        dust_top_n = int(dust_top_n)
+        dust_decay = float(dust_decay)
+        miner_budget = 1.0 - burn_rate
+        if not 0.0 <= burn_rate <= 1.0:
+            raise ValueError(f"burn_rate must be between 0 and 1, got {burn_rate}")
+        if not 0.0 <= winner_weight <= miner_budget:
+            raise ValueError(
+                f"winner_weight must be between 0 and miner budget "
+                f"{miner_budget}, got {winner_weight}"
+            )
+        if dust_top_n < 1:
+            raise ValueError(f"dust_top_n must be >= 1, got {dust_top_n}")
+        if dust_decay < 0.0:
+            raise ValueError(f"dust_decay must be >= 0, got {dust_decay}")
+
         eligible = [hk for hk in miner_hotkeys if self.is_eligible(hk)]
 
         if not eligible:
-            # Warmup phase: no miner has hit the eligibility threshold yet.
-            # Split reward equally among top WARMUP_TOP_N scoring active miners
-            # (those who have participated in >= 1 round).
-            active = [hk for hk in miner_hotkeys
-                      if self.get_participation_count(hk) > 0]
-
+            active = [
+                hk for hk in miner_hotkeys
+                if self.get_participation_count(hk) > 0
+            ]
             if not active:
-                logger.info("No active miners yet — all weights zero")
+                logger.info("No active miners yet — all miner weights zero")
                 return weights
 
-            # Sort by EMA score (desc); scores within SCORE_EPSILON are treated
-            # as tied and ranked by earliest submission time instead.
-            def _cmp(hk_a, hk_b):
-                sa = self.ema_scores.get(hk_a, 0.0)
-                sb = self.ema_scores.get(hk_b, 0.0)
-                ta = submission_times.get(hk_a, float("inf")) if submission_times else float("inf")
-                tb = submission_times.get(hk_b, float("inf")) if submission_times else float("inf")
-                if abs(sa - sb) <= SCORE_EPSILON:
-                    # Within epsilon — earlier submission ranks higher
-                    return -1 if ta < tb else (1 if ta > tb else 0)
-                # Clear score difference — higher EMA ranks higher
-                return -1 if sa > sb else 1
-
-            sorted_active = sorted(active, key=functools.cmp_to_key(_cmp))
-
-            # Positionally split among top N active miners with EMA > 0
+            sorted_active = self._sort_by_ema(
+                active, submission_times, tolerance=SCORE_EPSILON
+            )
             top_n = [
                 hk for hk in sorted_active[:WARMUP_TOP_N]
                 if self.ema_scores.get(hk, 0.0) > 0
             ]
-
             if top_n:
-                # Positional split: renormalize WARMUP_WEIGHTS to however many
-                # miners actually scored > 0 (e.g. if only 2, split 50/30 → ~0.625/0.375)
                 raw_w = WARMUP_WEIGHTS[:len(top_n)]
                 total_w = sum(raw_w)
-                positional_w = [w / total_w for w in raw_w]
-                for hk, w in zip(top_n, positional_w):
-                    weights[hk] = w
-                top_scores = [
-                    (hk[:16], self.ema_scores.get(hk, 0.0), w)
-                    for hk, w in zip(top_n, positional_w)
-                ]
+                for hk, raw in zip(top_n, raw_w):
+                    weights[hk] = miner_budget * raw / total_w
                 logger.info(
-                    f"Warmup: top-{len(top_n)} positional split "
-                    f"(active: {len(active)}/{len(miner_hotkeys)}, "
-                    f"need {self.min_rounds} rounds for EMA eligibility): "
-                    + ", ".join(f"{hk}...=ema:{s:.4f} w:{w:.2f}" for hk, s, w in top_scores)
+                    f"Warmup: top-{len(top_n)} split over miner budget "
+                    f"{miner_budget:.4f}"
                 )
             else:
-                # All active miners have zero EMA — split among active only
-                equal_w = 1.0 / len(active)
+                equal_w = miner_budget / len(active) if active else 0.0
                 for hk in active:
                     weights[hk] = equal_w
                 logger.info(
                     f"Warmup: all active miners scored zero, "
-                    f"equal weights to {len(active)} active miners"
+                    f"equal miner-budget split to {len(active)} active miners"
                 )
             return weights
 
-        # Find winner: highest EMA, tiebreak by earliest submission
-        # Use tolerance for float comparison to avoid precision issues
-        EMA_TOLERANCE = 1e-9
-        best_hotkey = None
-        best_ema = -1.0
-        best_time = float("inf")
-
-        for hk in eligible:
-            ema = self.ema_scores.get(hk, 0.0)
-            sub_time = (
-                submission_times.get(hk, float("inf"))
-                if submission_times
-                else float("inf")
+        ranked = [
+            hk for hk in self._sort_by_ema(
+                eligible, submission_times, tolerance=EMA_TOLERANCE
             )
+            if self.ema_scores.get(hk, 0.0) > 0
+        ]
 
-            if ema > best_ema + EMA_TOLERANCE:
-                # Strictly better EMA — new winner
-                best_ema = ema
-                best_hotkey = hk
-                best_time = sub_time
-            elif abs(ema - best_ema) <= EMA_TOLERANCE and sub_time < best_time:
-                # EMA effectively tied — tiebreak by earliest submission
-                best_ema = ema
-                best_hotkey = hk
-                best_time = sub_time
-
-        if best_hotkey is not None and best_ema > 0:
-            weights[best_hotkey] = 1.0
-            logger.info(
-                f"Winner: {best_hotkey[:16]}... EMA={best_ema:.4f} "
-                f"(eligible: {len(eligible)}/{len(miner_hotkeys)})"
-            )
-        else:
-            # All eligible miners have zero EMA — return all-zero weights (fail closed).
-            # The caller (set_weights) will detect the zero total and skip submission
-            # rather than silently distributing equal emissions.
+        if not ranked:
             logger.warning(
                 f"All {len(eligible)} eligible miners have zero EMA — "
-                f"returning zero weights (no-op). Validator will skip weight submission."
+                f"returning zero miner weights (no-op)."
             )
+            return weights
 
+        winner = ranked[0]
+        weights[winner] = winner_weight
+
+        dust_pool = max(0.0, miner_budget - winner_weight)
+        dust_recipients = ranked[1:dust_top_n]
+        if dust_pool > 0 and dust_recipients:
+            dust_raw = [dust_decay ** i for i in range(len(dust_recipients))]
+            dust_total = sum(dust_raw)
+            if dust_total > 0:
+                for hk, raw in zip(dust_recipients, dust_raw):
+                    weights[hk] = dust_pool * raw / dust_total
+
+        logger.info(
+            f"Winner-heavy weights: winner={winner[:16]}... "
+            f"winner_weight={winner_weight:.4f}, "
+            f"dust_pool={dust_pool:.4f}, dust_recipients={len(dust_recipients)}"
+        )
         return weights
 
     def get_rankings(self, miner_hotkeys: List[str]) -> Dict[str, Optional[int]]:
@@ -381,7 +385,7 @@ class ScoreTracker:
             round_id: The round these weights correspond to.
             validator_hotkey: The validator's hotkey.
             miner_hotkeys: All miner hotkeys.
-            weights: The weight dict from get_winner_takes_all_weights().
+            weights: The weight dict from the active validator weight policy.
 
         Returns:
             List of entry dicts ready for the API.

@@ -53,7 +53,7 @@ score = AdvancedScorer.compute_advanced_score(results)
 
 ### 2. Weight Tracking (weight_tracking.py)
 
-**Purpose:** Tracks miner performance over time with EMA smoothing and winner-takes-all weights.
+**Purpose:** Tracks miner performance over time with EMA smoothing and winner-heavy pruning dust weights.
 
 **Main Class:** `ScoreTracker`
 
@@ -65,15 +65,21 @@ tracker = ScoreTracker(alpha=0.1)
 # Update a miner's score
 tracker.update(hotkey="5xxx...", raw_score=0.92)
 
-# Get normalized weights for blockchain
-weights = tracker.get_winner_takes_all_weights(miner_hotkeys=["5xxx...", "5yyy..."])
+# Get absolute miner weights before the validator adds burn
+weights = tracker.get_winner_heavy_pruning_dust_weights(
+    miner_hotkeys=["5xxx...", "5yyy..."],
+    burn_rate=0.87,
+    winner_weight=0.10,
+    dust_top_n=10,
+    dust_decay=0.8,
+)
 # Returns: {hotkey: weight} mapping
 ```
 
 **Algorithm:**
 
 1. **EMA Smoothing:**
-2. **Winner-Takes-All:** 
+2. **Winner-Heavy Pruning Dust:**
 3. **Participation Gating:** 
 4. **Normalization:** 
 
@@ -194,7 +200,7 @@ await client.submit_score(
    ValidatorPlatformClient.get_backfill_scores()
    ScoreTracker.record_round(personal + backfilled hotkeys)
    |
-8. ScoreTracker.get_winner_takes_all_weights()
+8. ScoreTracker.get_winner_heavy_pruning_dust_weights()
    ValidatorPlatformClient.submit_weight_history()
    set_weights() on Bittensor if validator is registered
 ```

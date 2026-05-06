@@ -135,8 +135,10 @@ class PlatformClient:
             return False
 
     async def get_network_config(self) -> Optional[Dict[str, Any]]:
-        """Fetch network reward params (burn_rate, burn_uid). Returns None on
-        any error so the caller can fall back to env defaults."""
+        """Fetch authoritative network reward params.
+
+        Returns None on any error; validators must treat that as fail-closed.
+        """
         try:
             async with self._get_client() as client:
                 response = await client.get("/scoring/network-config")
@@ -787,7 +789,7 @@ class ValidatorPlatformClient(PlatformClient):
     ) -> Dict[str, Any]:
         """Submit weight history (EMA scores, ranks, weights) for a round.
 
-        Called after computing winner-takes-all weights so the platform
+        Called after computing validator weights so the platform
         can display historical scoring data on the dashboard.
 
         Args:

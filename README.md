@@ -87,7 +87,7 @@ minos_subnet/
 │   └── tool_params.py        # Parameter definitions and validation
 ├── utils/                    # Genomics utility modules
 │   ├── scoring.py            # hap.py Docker runner + AdvancedScorer
-│   ├── weight_tracking.py    # EMA score tracker + winner-takes-all weights
+│   ├── weight_tracking.py    # EMA score tracker + winner-heavy pruning dust weights
 │   ├── platform_client.py    # Authenticated API client (miner + validator)
 │   ├── subset_scoring.py     # Subset scoring helpers (assignments, deadlines)
 │   ├── config_loader.py      # Tool config file parser
@@ -433,9 +433,9 @@ ema = (1 - alpha) * ema + alpha * combined_final
 
 Weights are assigned in two phases:
 
-**Warmup** (before any miner has reached eligibility): reward is split among the top 3 active miners by EMA score — 50% to 1st, 30% to 2nd, 20% to 3rd. If fewer than three active miners have positive EMA, the split is renormalized across the active positive-score set.
+**Warmup** (before any miner has reached eligibility): the non-burn miner budget is split among the top 3 active miners by EMA score — 50% to 1st, 30% to 2nd, 20% to 3rd. If fewer than three active miners have positive EMA, the split is renormalized across the active positive-score set.
 
-**Normal** (once any miner reaches eligibility): the single top-performing eligible miner by EMA receives 100% of the weight. Eligibility requires scoring in at least 10 of the last 20 rounds. Miners below the participation threshold receive 0 weight in normal mode. Absent miners' EMA decays each round they miss (×0.95), preventing stale scores from holding weight indefinitely.
+**Normal** (once any miner reaches eligibility): validators burn 87% of their weight, give the top eligible miner 10%, and split the remaining 3% as ranked pruning dust across eligible ranks #2 through #10 using a 0.8 geometric decay. If fewer dust recipients exist, that 3% is renormalized across the available ranks; if no dust recipients exist, unused dust is sent to burn. Eligibility requires scoring in at least 10 of the last 20 rounds. Miners below the participation threshold receive 0 weight in normal mode. Absent miners' EMA decays each round they miss (×0.95), preventing stale scores from holding weight indefinitely.
 
 In the warmup phase, miners with scores within 0.5% of each other are tiebroken by earliest config submission time. In the normal phase, tiebreaks only apply when EMA scores are essentially identical (floating-point tolerance).
 

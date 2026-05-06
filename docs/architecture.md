@@ -128,7 +128,7 @@ while True:
             update_ema(entry.hotkey, entry.score)
         record_round(personal_hotkeys + backfill_hotkeys)
 
-        weights = compute_weights()             # warmup split or winner-takes-all
+        weights = compute_weights()             # warmup split or winner-heavy pruning dust
         submit_weight_history(weights)          # platform dashboard/audit
         if registered_on_subnet:
             set_weights_on_chain(weights)       # Bittensor chain write
@@ -152,13 +152,13 @@ hap.py computes SNP and INDEL precision/recall against the truth VCF. The `Advan
 
 SNP/INDEL weighting is truth-count-proportional (fallback: 70/30).
 
-### 5.2 Weight assignment (EMA + winner-takes-all)
+### 5.2 Weight assignment (EMA + winner-heavy pruning dust)
 
 - Each scored round updates each miner's EMA: `ema = α × score + (1−α) × ema` (α = 0.1); EMA starts at 0 so the first round yields 10% of the first score
 - Miners must participate in ≥ 10 of the last 20 rounds to be eligible for weights
 - Missed rounds decay the EMA by 0.95× per missed round
-- **Warmup phase** (before any miner reaches 10 rounds): reward split 50/30/20 among the top 3 active miners with positive EMA; the split is renormalized if fewer than three qualify; tiebreak by earliest config submission time
-- **Normal phase** (once any miner reaches eligibility): the eligible miner with the highest EMA receives **100% of the weight** on-chain; tiebreak by earliest config submission time
+- **Warmup phase** (before any miner reaches 10 rounds): the non-burn miner budget is split 50/30/20 among the top 3 active miners with positive EMA; the split is renormalized if fewer than three qualify; tiebreak by earliest config submission time
+- **Normal phase** (once any miner reaches eligibility): 87% goes to the burn UID, the highest-EMA eligible miner receives 10%, and the remaining 3% is distributed as ranked pruning dust across eligible ranks #2 through #10 using geometric decay; tiebreak by earliest config submission time
 - Miners below the participation threshold receive 0 weight
 
 ---
@@ -193,7 +193,7 @@ minos_subnet/
 │   └── tool_params.py     # Parameter definitions and validation
 ├── utils/
 │   ├── scoring.py         # hap.py Docker runner + AdvancedScorer
-│   ├── weight_tracking.py # EMA score tracker + winner-takes-all weights
+│   ├── weight_tracking.py # EMA score tracker + winner-heavy pruning dust weights
 │   ├── platform_client.py # Authenticated API client (miner + validator)
 │   ├── subset_scoring.py  # Subset scoring helpers (assignments, deadlines)
 │   ├── config_loader.py   # Tool config file parser

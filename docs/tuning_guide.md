@@ -34,9 +34,9 @@ The AdvancedScorer outputs a raw score on a 0–100 scale. This is normalized to
 - Missing rounds applies a decay factor of 0.95 per missed round to your EMA.
 - When reading logs: `Score: 85.00/100  EMA: 0.0850` is a typical first-round result with alpha = 0.1. The score is 0–100; the EMA is 0–1 and moves gradually.
 
-**Warmup phase** (until any miner has participated in 10+ rounds): rewards are split among the top 3 active miners by EMA — 50% to 1st, 30% to 2nd, 20% to 3rd, renormalized if fewer than three active miners have positive EMA.
+**Warmup phase** (until any miner has participated in 10+ rounds): the non-burn miner budget is split among the top 3 active miners by EMA — 50% to 1st, 30% to 2nd, 20% to 3rd, renormalized if fewer than three active miners have positive EMA.
 
-**Normal phase** (after warmup): **winner-takes-all** among eligible miners — the eligible miner with the highest EMA gets 100% of emissions for that validator. Ineligible miners and second place get 0.
+**Normal phase** (after warmup): **winner-heavy with pruning dust** among eligible miners — validators burn 87%, give rank #1 10%, and split the remaining 3% across eligible ranks #2 through #10 with ranked decay. Ineligible miners and ranks below the dust cutoff get 0.
 
 Consistency matters as much as peak performance.
 
@@ -46,7 +46,7 @@ This is the most common question for new miners. There are three distinct causes
 
 **1. You are not eligible yet (most likely).** Eligibility requires participating in **at least 10 of the last 20 rounds**. With ~20 rounds per day, a fresh miner needs roughly 12 hours of continuous uptime before they can earn any weight, even with perfect scores. During this time you appear in validator logs but receive 0 weight. This is expected.
 
-**2. You are eligible but a competitor has a higher EMA.** Once eligible, weights are winner-takes-all. If another miner has a higher EMA than yours (even by a tiny margin), they get 100% and you get 0. The fix is to score better — see Section 4 (Tuning Strategy).
+**2. You are eligible but outside the paid ranks.** Once eligible, the top miner gets the main 10% miner weight and eligible ranks #2 through #10 split the pruning dust. If your EMA is below the paid cutoff, you get 0. The fix is to score better — see Section 4 (Tuning Strategy).
 
 **3. You are submitting but the score is 0.** Causes: wrong reference build, malformed VCF (multi-sample, missing index), tool config rejected by the parameter whitelist, or a Docker error. Check your logs for the line `Score: 0.00/100`. If you see it, the variant call ran but produced no usable output. If you do not see a score line at all, your submission never made it to the scoring phase — check the platform connectivity / round timing.
 
@@ -161,7 +161,7 @@ The scoring weights (60% F1, 15% completeness, 15% FP) mean you want to lean sli
 
 | Range   | Interpretation                                                    |
 |---------|-------------------------------------------------------------------|
-| 80-95+  | Competitive. You are in contention for winner-takes-all.          |
+| 80-95+  | Competitive. You are in contention for the top paid ranks.        |
 | 60-80   | Solid baseline. Targeted parameter tuning can push you higher.    |
 | 40-60   | Something is suboptimal. Check tool parameters and Docker image.  |
 | Below 40| Likely a configuration error. See Common Mistakes below.          |

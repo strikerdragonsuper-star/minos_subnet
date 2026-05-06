@@ -7,6 +7,10 @@ from utils.weight_tracking import (
     PARTICIPATION_WINDOW,
     WARMUP_WEIGHTS,
     SCORE_EPSILON,
+    DEFAULT_BURN_RATE,
+    DEFAULT_WINNER_WEIGHT,
+    DEFAULT_DUST_TOP_N,
+    DEFAULT_DUST_DECAY,
 )
 
 
@@ -47,6 +51,14 @@ def _make_active(tracker: ScoreTracker, hotkey: str, rounds: int = 1,
     for i in range(rounds):
         tracker.update(hotkey, score)
         tracker.record_round(f"active-{hotkey}-{i}", [hotkey])
+
+
+DEFAULT_REWARD_POLICY = {
+    "burn_rate": DEFAULT_BURN_RATE,
+    "winner_weight": DEFAULT_WINNER_WEIGHT,
+    "dust_top_n": DEFAULT_DUST_TOP_N,
+    "dust_decay": DEFAULT_DUST_DECAY,
+}
 
 
 # =========================================================================
@@ -216,147 +228,114 @@ class TestEligibility:
 
 
 # =========================================================================
-# TestWinnerTakesAllNormal
+# TestWinnerHeavyPruningDust
 # =========================================================================
 
-class TestWinnerTakesAllNormal:
-    """Normal mode: at least one eligible miner exists."""
+class TestWinnerHeavyPruningDust:
+    """Production normal mode: winner-heavy with pruning dust for top ranks."""
 
-    def test_single_eligible_miner(self, score_tracker):
-        _make_eligible(score_tracker, "hk_a", score=0.80)
-        weights = score_tracker.get_winner_takes_all_weights(["hk_a"])
-        assert weights["hk_a"] == pytest.approx(1.0)
+    def test_top_ten_distribution(self, score_tracker):
+        scores = {
+            f"hk_{i}": 1.0 - (i * 0.01)
+            for i in range(1, 12)
+        }
+        _make_eligible_group(score_tracker, scores)
 
-    def test_higher_ema_wins(self, score_tracker):
-        _make_eligible_group(score_tracker, {"hk_a": 0.90, "hk_b": 0.70})
-        weights = score_tracker.get_winner_takes_all_weights(["hk_a", "hk_b"])
-        assert weights["hk_a"] == pytest.approx(1.0)
-        assert weights["hk_b"] == pytest.approx(0.0)
-
-    def test_tie_ema_earlier_submission_wins(self, score_tracker):
-        _make_eligible_group(score_tracker, {"hk_a": 0.80, "hk_b": 0.80})
-        times = {"hk_a": 1000.0, "hk_b": 999.0}  # hk_b submitted earlier
-        weights = score_tracker.get_winner_takes_all_weights(
-            ["hk_a", "hk_b"], submission_times=times
+        hotkeys = list(scores.keys())
+        weights = score_tracker.get_winner_heavy_pruning_dust_weights(
+            hotkeys, **DEFAULT_REWARD_POLICY
         )
-        assert weights["hk_b"] == pytest.approx(1.0)
-        assert weights["hk_a"] == pytest.approx(0.0)
+
+        assert weights["hk_1"] == pytest.approx(DEFAULT_WINNER_WEIGHT)
+        assert weights["hk_11"] == pytest.approx(0.0)
+
+        dust_pool = 1.0 - DEFAULT_BURN_RATE - DEFAULT_WINNER_WEIGHT
+        dust_raw = [DEFAULT_DUST_DECAY ** i for i in range(DEFAULT_DUST_TOP_N - 1)]
+        dust_total = sum(dust_raw)
+        for rank in range(2, 11):
+            expected = dust_pool * dust_raw[rank - 2] / dust_total
+            assert weights[f"hk_{rank}"] == pytest.approx(expected)
+
+        assert sum(weights.values()) == pytest.approx(1.0 - DEFAULT_BURN_RATE)
+
+    def test_default_top_ten_dust_survives_u16_emit_rounding(self, score_tracker):
+        scores = {
+            f"hk_{i}": 1.0 - (i * 0.01)
+            for i in range(1, 11)
+        }
+        _make_eligible_group(score_tracker, scores)
+
+        weights = score_tracker.get_winner_heavy_pruning_dust_weights(
+            list(scores.keys()), **DEFAULT_REWARD_POLICY
+        )
+        burn_weight = 1.0 - sum(weights.values())
+        max_weight = max(burn_weight, max(weights.values()))
+
+        for rank in range(2, 11):
+            encoded = round(weights[f"hk_{rank}"] / max_weight * 65535)
+            assert encoded > 0
+
+    def test_fewer_than_ten_eligible_renormalizes_dust(self, score_tracker):
+        _make_eligible_group(
+            score_tracker,
+            {"hk_a": 0.90, "hk_b": 0.80, "hk_c": 0.70},
+        )
+
+        weights = score_tracker.get_winner_heavy_pruning_dust_weights(
+            ["hk_a", "hk_b", "hk_c"], **DEFAULT_REWARD_POLICY
+        )
+
+        dust_pool = 1.0 - DEFAULT_BURN_RATE - DEFAULT_WINNER_WEIGHT
+        dust_total = 1.0 + DEFAULT_DUST_DECAY
+        assert weights["hk_a"] == pytest.approx(DEFAULT_WINNER_WEIGHT)
+        assert weights["hk_b"] == pytest.approx(dust_pool / dust_total)
+        assert weights["hk_c"] == pytest.approx(dust_pool * DEFAULT_DUST_DECAY / dust_total)
+        assert sum(weights.values()) == pytest.approx(1.0 - DEFAULT_BURN_RATE)
+
+    def test_single_eligible_keeps_winner_weight_only(self, score_tracker):
+        _make_eligible(score_tracker, "hk_a", score=0.90)
+
+        weights = score_tracker.get_winner_heavy_pruning_dust_weights(
+            ["hk_a"], **DEFAULT_REWARD_POLICY
+        )
+
+        assert weights["hk_a"] == pytest.approx(DEFAULT_WINNER_WEIGHT)
+        assert sum(weights.values()) == pytest.approx(DEFAULT_WINNER_WEIGHT)
+
+    def test_ineligible_high_ema_gets_zero(self, score_tracker):
+        _make_eligible(score_tracker, "hk_a", score=0.80)
+        _make_active(score_tracker, "hk_b", rounds=1, score=0.99)
+
+        weights = score_tracker.get_winner_heavy_pruning_dust_weights(
+            ["hk_a", "hk_b"], **DEFAULT_REWARD_POLICY
+        )
+
+        assert weights["hk_a"] == pytest.approx(DEFAULT_WINNER_WEIGHT)
+        assert weights["hk_b"] == pytest.approx(0.0)
 
     def test_all_eligible_zero_ema_returns_all_zero(self, score_tracker):
-        """Fail-closed: if every eligible miner has EMA=0, all weights are 0."""
-        # Manually make eligible without actual scoring (force 0 EMA)
-        for i in range(10):
+        for i in range(score_tracker.min_rounds):
             score_tracker.record_round(f"r{i}", ["hk_a", "hk_b"])
-        # Participation is now 10, but no update() was ever called → EMA=0
-        weights = score_tracker.get_winner_takes_all_weights(["hk_a", "hk_b"])
+
+        weights = score_tracker.get_winner_heavy_pruning_dust_weights(
+            ["hk_a", "hk_b"], **DEFAULT_REWARD_POLICY
+        )
+
         assert weights["hk_a"] == pytest.approx(0.0)
         assert weights["hk_b"] == pytest.approx(0.0)
 
-    def test_winner_gets_one_others_zero(self, score_tracker):
-        _make_eligible_group(
-            score_tracker, {"hk_a": 0.90, "hk_b": 0.70, "hk_c": 0.50}
-        )
-        weights = score_tracker.get_winner_takes_all_weights(
-            ["hk_a", "hk_b", "hk_c"]
-        )
-        assert weights["hk_a"] == pytest.approx(1.0)
-        assert weights["hk_b"] == pytest.approx(0.0)
-        assert weights["hk_c"] == pytest.approx(0.0)
-
-    def test_non_eligible_miners_always_zero(self, score_tracker):
-        _make_eligible(score_tracker, "hk_a", score=0.90)
-        # hk_b has only 1 round
-        _make_active(score_tracker, "hk_b", rounds=1, score=0.99)
-        weights = score_tracker.get_winner_takes_all_weights(["hk_a", "hk_b"])
-        assert weights["hk_a"] == pytest.approx(1.0)
-        assert weights["hk_b"] == pytest.approx(0.0)
-
-    def test_empty_miner_list(self, score_tracker):
-        weights = score_tracker.get_winner_takes_all_weights([])
-        assert weights == {}
-
-    def test_no_submission_times_still_works(self, score_tracker):
-        _make_eligible(score_tracker, "hk_a", score=0.80)
-        weights = score_tracker.get_winner_takes_all_weights(
-            ["hk_a"], submission_times=None
-        )
-        assert weights["hk_a"] == pytest.approx(1.0)
-
-
-# =========================================================================
-# TestWinnerTakesAllWarmup
-# =========================================================================
-
-class TestWinnerTakesAllWarmup:
-    """Warmup mode: no miner has reached eligibility yet."""
-
-    def test_one_active_gets_full_weight(self, score_tracker):
-        """1 active miner → renormalized [0.5] = [1.0]."""
-        _make_active(score_tracker, "hk_a", rounds=1, score=0.80)
-        weights = score_tracker.get_winner_takes_all_weights(["hk_a"])
-        assert weights["hk_a"] == pytest.approx(1.0)
-
-    def test_two_active_renormalized_split(self, score_tracker):
-        """2 active miners → renormalized [0.5, 0.3] = [0.625, 0.375]."""
+    def test_warmup_scaled_to_non_burn_budget(self, score_tracker):
         _make_active(score_tracker, "hk_a", rounds=1, score=0.90)
         _make_active(score_tracker, "hk_b", rounds=1, score=0.70)
-        weights = score_tracker.get_winner_takes_all_weights(["hk_a", "hk_b"])
-        assert weights["hk_a"] == pytest.approx(0.5 / 0.8)  # 0.625
-        assert weights["hk_b"] == pytest.approx(0.3 / 0.8)  # 0.375
 
-    def test_three_active_exact_warmup_weights(self, score_tracker):
-        """3 active miners → 50/30/20 split."""
-        _make_active(score_tracker, "hk_a", rounds=1, score=0.90)
-        _make_active(score_tracker, "hk_b", rounds=1, score=0.70)
-        _make_active(score_tracker, "hk_c", rounds=1, score=0.50)
-        weights = score_tracker.get_winner_takes_all_weights(
-            ["hk_a", "hk_b", "hk_c"]
+        weights = score_tracker.get_winner_heavy_pruning_dust_weights(
+            ["hk_a", "hk_b"], **DEFAULT_REWARD_POLICY
         )
-        assert weights["hk_a"] == pytest.approx(0.50)
-        assert weights["hk_b"] == pytest.approx(0.30)
-        assert weights["hk_c"] == pytest.approx(0.20)
 
-    def test_no_active_miners_all_zero(self, score_tracker):
-        """No one has participated → all weights zero."""
-        weights = score_tracker.get_winner_takes_all_weights(
-            ["hk_a", "hk_b"]
-        )
-        assert weights["hk_a"] == pytest.approx(0.0)
-        assert weights["hk_b"] == pytest.approx(0.0)
-
-    def test_all_active_zero_ema_equal_split(self, score_tracker):
-        """All active miners have zero EMA → equal split among active."""
-        # Make active via record_round but never call update()
-        score_tracker.record_round("r0", ["hk_a", "hk_b"])
-        weights = score_tracker.get_winner_takes_all_weights(
-            ["hk_a", "hk_b"]
-        )
-        assert weights["hk_a"] == pytest.approx(0.5)
-        assert weights["hk_b"] == pytest.approx(0.5)
-
-    def test_tiebreak_by_submission_time_in_warmup(self, score_tracker):
-        """Within SCORE_EPSILON, earlier submission wins higher position."""
-        # Both get EMA within epsilon of each other
-        _make_active(score_tracker, "hk_a", rounds=1, score=0.80)
-        _make_active(score_tracker, "hk_b", rounds=1, score=0.80)
-        times = {"hk_a": 500.0, "hk_b": 100.0}  # hk_b is earlier
-        weights = score_tracker.get_winner_takes_all_weights(
-            ["hk_a", "hk_b"], submission_times=times
-        )
-        # hk_b should rank first (earlier time), hk_a second
-        assert weights["hk_b"] > weights["hk_a"]
-        # Renormalized [0.5, 0.3] → 0.625, 0.375
-        assert weights["hk_b"] == pytest.approx(0.5 / 0.8)
-        assert weights["hk_a"] == pytest.approx(0.3 / 0.8)
-
-    def test_inactive_miners_get_zero_in_warmup(self, score_tracker):
-        """Miners with 0 participation get 0 even in warmup."""
-        _make_active(score_tracker, "hk_a", rounds=1, score=0.80)
-        weights = score_tracker.get_winner_takes_all_weights(
-            ["hk_a", "hk_inactive"]
-        )
-        assert weights["hk_a"] == pytest.approx(1.0)
-        assert weights["hk_inactive"] == pytest.approx(0.0)
+        miner_budget = 1.0 - DEFAULT_BURN_RATE
+        assert weights["hk_a"] == pytest.approx(miner_budget * 0.5 / 0.8)
+        assert weights["hk_b"] == pytest.approx(miner_budget * 0.3 / 0.8)
+        assert sum(weights.values()) == pytest.approx(miner_budget)
 
 
 # =========================================================================
@@ -424,7 +403,9 @@ class TestRankingsAndHistory:
         tracker = score_tracker_low_threshold
         _make_eligible_group(tracker, {"hk_a": 0.90, "hk_b": 0.70})
 
-        weights = tracker.get_winner_takes_all_weights(["hk_a", "hk_b"])
+        weights = tracker.get_winner_heavy_pruning_dust_weights(
+            ["hk_a", "hk_b"], **DEFAULT_REWARD_POLICY
+        )
         entries = tracker.build_weight_history(
             round_id="r_final",
             validator_hotkey="val_hk",
@@ -440,11 +421,13 @@ class TestRankingsAndHistory:
 
         # Winner entry
         winner = [e for e in entries if e["miner_hotkey"] == "hk_a"][0]
-        assert winner["weight"] == pytest.approx(1.0)
+        assert winner["weight"] == pytest.approx(DEFAULT_WINNER_WEIGHT)
         assert winner["eligible"] is True
         assert winner["rank"] == 1
 
         loser = [e for e in entries if e["miner_hotkey"] == "hk_b"][0]
-        assert loser["weight"] == pytest.approx(0.0)
+        assert loser["weight"] == pytest.approx(
+            1.0 - DEFAULT_BURN_RATE - DEFAULT_WINNER_WEIGHT
+        )
         assert loser["eligible"] is True
         assert loser["rank"] == 2

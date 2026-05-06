@@ -31,8 +31,6 @@ GENOMICS_CONFIG = {
     "variant_calling_timeout": 7200 if is_local_network() else 3600,  # 2h local, 1h production
     "task_interval": int(os.getenv("TASK_INTERVAL", "600" if is_local_network() else "3600")),  # 10m local, 1h production
 
-    # Fraction of weight sent to UID 0 for burn. Set BURN_RATE=0 to disable.
-    "burn_rate": float(os.getenv("BURN_RATE", "0.9")),
 }
 
 # Validator specific settings
