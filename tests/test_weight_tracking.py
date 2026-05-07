@@ -367,6 +367,26 @@ class TestCanonicalTiebreak:
     and uses that as a tiebreaker only inside the tolerance band.
     """
 
+    def test_canonical_not_needed_during_warmup(self, score_tracker):
+        _make_active(score_tracker, "hk_a", rounds=1, score=0.90)
+        _make_active(score_tracker, "hk_b", rounds=1, score=0.89)
+        assert not score_tracker.needs_canonical_tiebreak(["hk_a", "hk_b"])
+
+    def test_canonical_not_needed_for_clear_local_winner(self, score_tracker):
+        _seed_eligible_emas(score_tracker, {"hk_a": 0.700, "hk_b": 0.650})
+        assert not score_tracker.needs_canonical_tiebreak(["hk_a", "hk_b"])
+
+    def test_canonical_needed_for_close_local_winner(self, score_tracker):
+        _seed_eligible_emas(score_tracker, {"hk_a": 0.700, "hk_b": 0.695})
+        assert score_tracker.needs_canonical_tiebreak(["hk_a", "hk_b"])
+
+    def test_canonical_needed_at_exact_tolerance_boundary(self, score_tracker):
+        gap = CANONICAL_TIEBREAK_TOLERANCE
+        _seed_eligible_emas(
+            score_tracker, {"hk_a": 0.70, "hk_b": 0.70 - gap}
+        )
+        assert score_tracker.needs_canonical_tiebreak(["hk_a", "hk_b"])
+
     def test_canonical_used_when_within_tolerance(self, score_tracker):
         # Local rank-1 = hk_a (0.700 EMA), rank-2 = hk_b (0.695 EMA).
         # Gap 0.5%, within 2% tolerance. Canonical says hk_b, so hk_b wins.

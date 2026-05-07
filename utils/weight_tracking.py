@@ -248,6 +248,37 @@ class ScoreTracker:
 
         return sorted(hotkeys, key=functools.cmp_to_key(_cmp))
 
+    def _ranked_positive_eligible(
+        self,
+        miner_hotkeys: List[str],
+        submission_times: Optional[Dict[str, float]] = None,
+    ) -> List[str]:
+        """Return eligible miners with positive EMA, ordered by local EMA."""
+        eligible = [hk for hk in miner_hotkeys if self.is_eligible(hk)]
+        return [
+            hk for hk in self._sort_by_ema(
+                eligible, submission_times, tolerance=EMA_TOLERANCE
+            )
+            if self.ema_scores.get(hk, 0.0) > 0
+        ]
+
+    def needs_canonical_tiebreak(
+        self,
+        miner_hotkeys: List[str],
+        submission_times: Optional[Dict[str, float]] = None,
+    ) -> bool:
+        """Return True when canonical ranking can affect winner selection."""
+        ranked = self._ranked_positive_eligible(miner_hotkeys, submission_times)
+        if len(ranked) < 2:
+            return False
+
+        top_ema = self.ema_scores.get(ranked[0], 0.0)
+        return any(
+            (top_ema - self.ema_scores.get(hk, 0.0))
+            <= CANONICAL_TIEBREAK_TOLERANCE + EMA_TOLERANCE
+            for hk in ranked[1:]
+        )
+
     def get_winner_heavy_pruning_dust_weights(
         self,
         miner_hotkeys: List[str],
@@ -337,12 +368,7 @@ class ScoreTracker:
                 )
             return weights
 
-        ranked = [
-            hk for hk in self._sort_by_ema(
-                eligible, submission_times, tolerance=EMA_TOLERANCE
-            )
-            if self.ema_scores.get(hk, 0.0) > 0
-        ]
+        ranked = self._ranked_positive_eligible(miner_hotkeys, submission_times)
 
         if not ranked:
             logger.warning(

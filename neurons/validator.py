@@ -7,6 +7,7 @@ import math
 import shutil
 import traceback
 import subprocess
+from copy import deepcopy
 from pathlib import Path
 
 # Add parent directory to path so we can import base and utils
@@ -465,6 +466,7 @@ class Validator:
             # --- Step 3 & 4: Order submissions and score ---
             scored_hotkeys = []
             submission_times = {}
+            score_tracker_snapshot = self._score_tracker_snapshot()
 
             # Restart recovery: restore already-scored miners
             already_scored = round_data.get("scored_miners") or {}
@@ -547,13 +549,32 @@ class Validator:
                 await asyncio.gather(*[_bounded_score(s, False) for s in ordered_subs])
 
             # --- Steps 5 & 6: Backfill + finalize ---
-            await self._finalize_round_scores(
+            finalized = await self._finalize_round_scores(
                 round_id, scored_hotkeys, submission_times, scoring_deadline
             )
+            if not finalized:
+                self._restore_score_tracker(score_tracker_snapshot)
 
         except Exception as e:
+            if "score_tracker_snapshot" in locals():
+                self._restore_score_tracker(score_tracker_snapshot)
             bt.logging.error(f"Error scoring round {round_id}: {e}")
             bt.logging.debug(traceback.format_exc())
+
+    def _score_tracker_snapshot(self) -> dict:
+        """Capture ScoreTracker state before applying a round."""
+        return {
+            "ema_scores": dict(self.score_tracker.ema_scores),
+            "last_raw_scores": dict(self.score_tracker.last_raw_scores),
+            "round_history": deepcopy(self.score_tracker.round_history),
+        }
+
+    def _restore_score_tracker(self, snapshot: dict):
+        """Restore ScoreTracker state after an unfinalized round."""
+        self.score_tracker.ema_scores = dict(snapshot["ema_scores"])
+        self.score_tracker.last_raw_scores = dict(snapshot["last_raw_scores"])
+        self.score_tracker.round_history = deepcopy(snapshot["round_history"])
+        self.score_tracker._recalculate_participation()
 
     def _download_round_files(self, round_id, round_data):
         """Download BAM + truth VCF and verify reference files; return paths dict or None on failure."""
@@ -881,7 +902,7 @@ class Validator:
         scored_hotkeys: list,
         submission_times: dict,
         scoring_deadline=None,
-    ):
+    ) -> bool:
         """Backfill gap miners from platform, record participation, then set weights.
 
         Order matters:
@@ -1013,7 +1034,7 @@ class Validator:
                     f"Round {round_id}: backfill fetch failed ({e}). "
                     "Skipping weight submission to avoid validator divergence."
                 )
-                return
+                return False
 
         # --- Step 4: Record round with COMPLETE hotkey set ---
         # This must happen after backfill so decay is only applied to miners
@@ -1027,8 +1048,8 @@ class Validator:
 
         # --- Step 5: Set chain weights ---
         await self._set_weights_after_round(round_id, submission_times)
-
         print(f"\n   Round {round_id} scoring complete", flush=True)
+        return True
 
     async def _run_miner_tool(
         self,
@@ -1319,122 +1340,130 @@ class Validator:
                 )
                 return
 
-            # Fetch a round-pinned canonical ranking for close-call winner
-            # selection. If the ranking is unavailable or below quorum, skip
-            # this weight update rather than submitting a local-only winner.
-            # Passing round_id avoids sampling different "latest completed"
-            # rounds during the scheduler's status-promotion interval.
-            canonical_response = await self.platform_client.get_canonical_ranking(
-                round_id=round_id
+            canonical_ranking = None
+            canonical_needed = self.score_tracker.needs_canonical_tiebreak(
+                tracked_miners,
+                submission_times,
             )
-            canonical_ranking = []
-            canonical_parse_failed = False
-            canonical_low_coverage = False
-            if canonical_response is None:
-                # Transport errors and unavailable responses are handled below
-                # by skipping this weight update.
-                pass
-            elif not isinstance(canonical_response, dict):
-                canonical_parse_failed = True
-            else:
-                ranking = canonical_response.get("ranking")
-                if not isinstance(ranking, list):
+            if canonical_needed:
+                # Fetch a round-pinned canonical ranking for close-call winner
+                # selection. If the ranking is unavailable or below quorum,
+                # skip this weight update rather than submitting a local-only
+                # close-call winner. Passing round_id avoids sampling different
+                # "latest completed" rounds during the scheduler's
+                # status-promotion interval.
+                canonical_response = await self.platform_client.get_canonical_ranking(
+                    round_id=round_id
+                )
+                canonical_ranking = []
+                canonical_parse_failed = False
+                canonical_low_coverage = False
+                if canonical_response is None:
+                    # Transport errors and unavailable responses are handled
+                    # below by skipping this weight update.
+                    pass
+                elif not isinstance(canonical_response, dict):
                     canonical_parse_failed = True
-                elif not ranking:
-                    canonical_low_coverage = True
                 else:
-                    v_count = canonical_response.get("validator_count", 0)
-                    stake_total = canonical_response.get(
-                        "total_stake_considered", 0.0
-                    )
-                    min_total_stake = (
-                        canonical_min_validator_count
-                        * canonical_min_validator_stake
-                    )
-                    if not isinstance(v_count, int) or v_count < canonical_min_validator_count:
-                        canonical_low_coverage = True
-                    elif not isinstance(stake_total, (int, float)) or stake_total < min_total_stake:
+                    ranking = canonical_response.get("ranking")
+                    if not isinstance(ranking, list):
+                        canonical_parse_failed = True
+                    elif not ranking:
                         canonical_low_coverage = True
                     else:
-                        for entry in ranking:
-                            if not isinstance(entry, dict):
-                                canonical_parse_failed = True
-                                break
-                            raw = entry.get("miner_hotkey")
-                            if not isinstance(raw, str):
-                                canonical_parse_failed = True
-                                break
-                            # Trim accidental whitespace without changing
-                            # ss58 casing.
-                            candidate = raw.strip()
-                            if not candidate:
-                                canonical_parse_failed = True
-                                break
-
-                            # Keep a validator-side quorum check for rolling
-                            # upgrades and skip only the affected entry.
-                            entry_count = entry.get("validator_count", 0)
-                            if (
-                                not isinstance(entry_count, int)
-                                or entry_count < canonical_min_validator_count
-                            ):
-                                continue
-                            canonical_ranking.append(candidate)
-
-                        if not canonical_parse_failed and not canonical_ranking:
-                            # No ranked miner met the validator-side quorum.
+                        v_count = canonical_response.get("validator_count", 0)
+                        stake_total = canonical_response.get(
+                            "total_stake_considered", 0.0
+                        )
+                        min_total_stake = (
+                            canonical_min_validator_count
+                            * canonical_min_validator_stake
+                        )
+                        if not isinstance(v_count, int) or v_count < canonical_min_validator_count:
                             canonical_low_coverage = True
+                        elif not isinstance(stake_total, (int, float)) or stake_total < min_total_stake:
+                            canonical_low_coverage = True
+                        else:
+                            for entry in ranking:
+                                if not isinstance(entry, dict):
+                                    canonical_parse_failed = True
+                                    break
+                                raw = entry.get("miner_hotkey")
+                                if not isinstance(raw, str):
+                                    canonical_parse_failed = True
+                                    break
+                                # Trim accidental whitespace without changing
+                                # ss58 casing.
+                                candidate = raw.strip()
+                                if not candidate:
+                                    canonical_parse_failed = True
+                                    break
 
-            if canonical_parse_failed:
-                bt.logging.error(
-                    f"Canonical ranking response malformed "
-                    f"(shape={type(canonical_response).__name__}); "
-                    "skipping weight submission. Check "
-                    "/scoring/canonical-ranking."
-                )
-                return
-            elif canonical_low_coverage:
-                bt.logging.error(
-                    f"Canonical ranking has insufficient coverage for "
-                    f"round {round_id} "
-                    f"(validators={canonical_response.get('validator_count')}, "
-                    f"top_validators="
-                    f"{(canonical_response.get('ranking') or [{}])[0].get('validator_count')}, "
-                    f"stake={canonical_response.get('total_stake_considered')}; "
-                    f"min={canonical_min_validator_count} validators / "
-                    f"{canonical_min_validator_stake} TAO each). Skipping "
-                    "weight submission to avoid validator divergence."
-                )
-                return
-            elif canonical_ranking:
-                bt.logging.info(
-                    f"Canonical ranking top={canonical_ranking[0][:16]}... "
-                    f"({len(canonical_ranking)} candidates) for "
-                    f"round {round_id} "
-                    f"(coverage: {canonical_response.get('validator_count')} "
-                    f"validators, "
-                    f"{canonical_response.get('total_stake_considered'):.0f} TAO)"
-                )
-                local_eligible_positive = {
-                    hk
-                    for hk in tracked_miners
-                    if self.score_tracker.is_eligible(hk)
-                    and self.score_tracker.ema_scores.get(hk, 0.0) > 0
-                }
-                if not any(hk in local_eligible_positive for hk in canonical_ranking):
+                                # Keep a validator-side quorum check for
+                                # rolling upgrades and skip only the affected
+                                # entry.
+                                entry_count = entry.get("validator_count", 0)
+                                if (
+                                    not isinstance(entry_count, int)
+                                    or entry_count < canonical_min_validator_count
+                                ):
+                                    continue
+                                canonical_ranking.append(candidate)
+
+                            if not canonical_parse_failed and not canonical_ranking:
+                                # No ranked miner met the validator-side quorum.
+                                canonical_low_coverage = True
+
+                if canonical_parse_failed:
                     bt.logging.error(
-                        "Canonical ranking has no locally eligible "
-                        "candidate — skipping weight submission to avoid "
-                        "local-only winner selection."
+                        f"Canonical ranking response malformed "
+                        f"(shape={type(canonical_response).__name__}); "
+                        "skipping weight submission. Check "
+                        "/scoring/canonical-ranking."
                     )
                     return
-            else:
-                bt.logging.error(
-                    f"Canonical ranking unavailable for round "
-                    f"{round_id} — skipping weight submission to avoid "
-                    "validator divergence"
-                )
-                return
+                elif canonical_low_coverage:
+                    bt.logging.error(
+                        f"Canonical ranking has insufficient coverage for "
+                        f"round {round_id} "
+                        f"(validators={canonical_response.get('validator_count')}, "
+                        f"top_validators="
+                        f"{(canonical_response.get('ranking') or [{}])[0].get('validator_count')}, "
+                        f"stake={canonical_response.get('total_stake_considered')}; "
+                        f"min={canonical_min_validator_count} validators / "
+                        f"{canonical_min_validator_stake} TAO each). Skipping "
+                        "weight submission to avoid validator divergence."
+                    )
+                    return
+                elif canonical_ranking:
+                    bt.logging.info(
+                        f"Canonical ranking top={canonical_ranking[0][:16]}... "
+                        f"({len(canonical_ranking)} candidates) for "
+                        f"round {round_id} "
+                        f"(coverage: {canonical_response.get('validator_count')} "
+                        f"validators, "
+                        f"{canonical_response.get('total_stake_considered'):.0f} TAO)"
+                    )
+                    local_eligible_positive = {
+                        hk
+                        for hk in tracked_miners
+                        if self.score_tracker.is_eligible(hk)
+                        and self.score_tracker.ema_scores.get(hk, 0.0) > 0
+                    }
+                    if not any(hk in local_eligible_positive for hk in canonical_ranking):
+                        bt.logging.error(
+                            "Canonical ranking has no locally eligible "
+                            "candidate — skipping weight submission to avoid "
+                            "local-only winner selection."
+                        )
+                        return
+                else:
+                    bt.logging.error(
+                        f"Canonical ranking unavailable for round "
+                        f"{round_id} — skipping weight submission to avoid "
+                        "validator divergence"
+                    )
+                    return
 
             weights = self.score_tracker.get_winner_heavy_pruning_dust_weights(
                 tracked_miners,
