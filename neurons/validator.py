@@ -7,6 +7,7 @@ import math
 import shutil
 import traceback
 import subprocess
+from copy import deepcopy
 from pathlib import Path
 
 # Add parent directory to path so we can import base and utils
@@ -18,6 +19,8 @@ import argparse
 import numpy as np
 import asyncio
 from datetime import datetime, timedelta, timezone
+from typing import Optional
+
 from dotenv import load_dotenv
 
 from neurons import __SPEC_VERSION__
@@ -35,6 +38,10 @@ from utils import (
     HappyScorer,
     ScoreTracker,
     AdvancedScorer,
+)
+from utils.weight_tracking import (
+    CANONICAL_MIN_VALIDATOR_COUNT,
+    CANONICAL_MIN_VALIDATOR_STAKE,
 )
 from utils.scoring import parse_happy_vcf, BCFTOOLS_DOCKER_IMAGE
 from utils.file_utils import compute_sha256
@@ -57,6 +64,8 @@ MAX_WAIT_SECONDS = 14400
 MIN_WAIT_SECONDS = 60
 BITTENSOR_BLOCK_TIME_SECONDS = 12
 MAX_SLEEP_SECONDS = 120
+SCORE_GRACE_SECONDS = int(os.getenv("SCORE_GRACE_SECONDS", "60"))
+SCORE_FINALIZATION_DELAY_SECONDS = int(os.getenv("SCORE_FINALIZATION_DELAY_SECONDS", "5"))
 
 
 def auto_scoring_config():
@@ -457,6 +466,7 @@ class Validator:
             # --- Step 3 & 4: Order submissions and score ---
             scored_hotkeys = []
             submission_times = {}
+            score_tracker_snapshot = self._score_tracker_snapshot()
 
             # Restart recovery: restore already-scored miners
             already_scored = round_data.get("scored_miners") or {}
@@ -539,13 +549,32 @@ class Validator:
                 await asyncio.gather(*[_bounded_score(s, False) for s in ordered_subs])
 
             # --- Steps 5 & 6: Backfill + finalize ---
-            await self._finalize_round_scores(
+            finalized = await self._finalize_round_scores(
                 round_id, scored_hotkeys, submission_times, scoring_deadline
             )
+            if not finalized:
+                self._restore_score_tracker(score_tracker_snapshot)
 
         except Exception as e:
+            if "score_tracker_snapshot" in locals():
+                self._restore_score_tracker(score_tracker_snapshot)
             bt.logging.error(f"Error scoring round {round_id}: {e}")
             bt.logging.debug(traceback.format_exc())
+
+    def _score_tracker_snapshot(self) -> dict:
+        """Capture ScoreTracker state before applying a round."""
+        return {
+            "ema_scores": dict(self.score_tracker.ema_scores),
+            "last_raw_scores": dict(self.score_tracker.last_raw_scores),
+            "round_history": deepcopy(self.score_tracker.round_history),
+        }
+
+    def _restore_score_tracker(self, snapshot: dict):
+        """Restore ScoreTracker state after an unfinalized round."""
+        self.score_tracker.ema_scores = dict(snapshot["ema_scores"])
+        self.score_tracker.last_raw_scores = dict(snapshot["last_raw_scores"])
+        self.score_tracker.round_history = deepcopy(snapshot["round_history"])
+        self.score_tracker._recalculate_participation()
 
     def _download_round_files(self, round_id, round_data):
         """Download BAM + truth VCF and verify reference files; return paths dict or None on failure."""
@@ -873,27 +902,58 @@ class Validator:
         scored_hotkeys: list,
         submission_times: dict,
         scoring_deadline=None,
-    ):
+    ) -> bool:
         """Backfill gap miners from platform, record participation, then set weights.
 
         Order matters:
-        1. Wait for scoring window to close (commit-then-reveal gate).
+        1. Wait for scoring window + score grace to close (final-score gate).
         2. Fetch backfill scores for miners not personally covered.
         3. Feed each backfill score into ScoreTracker.update().
         4. Call record_round() ONCE with the complete set (personal + backfill).
         5. Set chain weights from the full EMA state.
         """
-        # --- Step 1: Wait for scoring window to close ---
+        # --- Step 1: Wait for scoring window + late-score grace to close ---
+        score_grace_seconds = SCORE_GRACE_SECONDS
+        finalization_delay_seconds = SCORE_FINALIZATION_DELAY_SECONDS
+        if self.platform_client:
+            try:
+                network_cfg = await self.platform_client.get_network_config()
+                if isinstance(network_cfg, dict):
+                    platform_grace = int(
+                        network_cfg.get("score_grace_seconds", score_grace_seconds)
+                    )
+                    platform_delay = int(
+                        network_cfg.get(
+                            "score_finalization_delay_seconds",
+                            finalization_delay_seconds,
+                        )
+                    )
+                    if platform_grace >= 0:
+                        score_grace_seconds = max(score_grace_seconds, platform_grace)
+                    if platform_delay >= 0:
+                        finalization_delay_seconds = max(
+                            finalization_delay_seconds, platform_delay
+                        )
+            except (TypeError, ValueError) as exc:
+                bt.logging.warning(
+                    f"Invalid platform score-grace config ({exc}); "
+                    f"using local defaults grace={score_grace_seconds}s, "
+                    f"finalization={finalization_delay_seconds}s"
+                )
+
         if scoring_deadline is not None:
             now = datetime.now(timezone.utc)
             # Ensure deadline is tz-aware
             if scoring_deadline.tzinfo is None:
                 scoring_deadline = scoring_deadline.replace(tzinfo=timezone.utc)
-            wait_secs = (scoring_deadline - now).total_seconds()
+            final_score_deadline = scoring_deadline + timedelta(
+                seconds=score_grace_seconds + finalization_delay_seconds
+            )
+            wait_secs = (final_score_deadline - now).total_seconds()
             if wait_secs > 0:
                 bt.logging.info(
-                    f"Round {round_id}: waiting {wait_secs:.0f}s for scoring window to close "
-                    f"before fetching backfill scores"
+                    f"Round {round_id}: waiting {wait_secs:.0f}s for score grace "
+                    f"+ finalization delay before fetching backfill/canonical scores"
                 )
                 await asyncio.sleep(wait_secs + 5)
 
@@ -904,10 +964,23 @@ class Validator:
 
         if self.platform_client:
             try:
-                backfill_response = await self.platform_client.get_backfill_scores(
-                    round_id=round_id,
-                    scored_miner_hotkeys=all_scored_hotkeys,
-                )
+                backfill_response = None
+                for attempt in range(6):
+                    try:
+                        backfill_response = await self.platform_client.get_backfill_scores(
+                            round_id=round_id,
+                            scored_miner_hotkeys=all_scored_hotkeys,
+                        )
+                        break
+                    except PlatformClientError as e:
+                        if "Too Early" not in str(e) or attempt >= 5:
+                            raise
+                        wait_seconds = min(15, 5 * (attempt + 1))
+                        bt.logging.info(
+                            f"Round {round_id}: platform final-score gate still closed; "
+                            f"retrying backfill in {wait_seconds}s"
+                        )
+                        await asyncio.sleep(wait_seconds)
 
                 backfill_scores = backfill_response.get("backfill_scores", [])
                 overlap_deltas = backfill_response.get("overlap_deltas", [])
@@ -957,10 +1030,11 @@ class Validator:
                         )
 
             except PlatformClientError as e:
-                bt.logging.warning(
+                bt.logging.error(
                     f"Round {round_id}: backfill fetch failed ({e}). "
-                    f"Proceeding with partial scores — unscored miners will decay normally."
+                    "Skipping weight submission to avoid validator divergence."
                 )
+                return False
 
         # --- Step 4: Record round with COMPLETE hotkey set ---
         # This must happen after backfill so decay is only applied to miners
@@ -974,8 +1048,8 @@ class Validator:
 
         # --- Step 5: Set chain weights ---
         await self._set_weights_after_round(round_id, submission_times)
-
         print(f"\n   Round {round_id} scoring complete", flush=True)
+        return True
 
     async def _run_miner_tool(
         self,
@@ -1216,6 +1290,18 @@ class Validator:
                 winner_weight = float(network_cfg["winner_weight"])
                 dust_top_n = int(network_cfg["dust_top_n"])
                 dust_decay = float(network_cfg["dust_decay"])
+                canonical_min_validator_count = int(
+                    network_cfg.get(
+                        "canonical_min_validator_count",
+                        CANONICAL_MIN_VALIDATOR_COUNT,
+                    )
+                )
+                canonical_min_validator_stake = float(
+                    network_cfg.get(
+                        "canonical_min_validator_stake",
+                        CANONICAL_MIN_VALIDATOR_STAKE,
+                    )
+                )
             except (TypeError, ValueError) as exc:
                 bt.logging.error(
                     f"Invalid network reward config {network_cfg}: {exc} — "
@@ -1241,6 +1327,143 @@ class Validator:
             if dust_decay < 0.0:
                 bt.logging.error(f"Invalid dust_decay={dust_decay} — skipping weight submission")
                 return
+            if canonical_min_validator_count < 1:
+                bt.logging.error(
+                    f"Invalid canonical_min_validator_count={canonical_min_validator_count} "
+                    "— skipping weight submission"
+                )
+                return
+            if canonical_min_validator_stake < 0.0:
+                bt.logging.error(
+                    f"Invalid canonical_min_validator_stake={canonical_min_validator_stake} "
+                    "— skipping weight submission"
+                )
+                return
+
+            canonical_ranking = None
+            canonical_needed = self.score_tracker.needs_canonical_tiebreak(
+                tracked_miners,
+                submission_times,
+            )
+            if canonical_needed:
+                # Fetch a round-pinned canonical ranking for close-call winner
+                # selection. If the ranking is unavailable or below quorum,
+                # skip this weight update rather than submitting a local-only
+                # close-call winner. Passing round_id avoids sampling different
+                # "latest completed" rounds during the scheduler's
+                # status-promotion interval.
+                canonical_response = await self.platform_client.get_canonical_ranking(
+                    round_id=round_id
+                )
+                canonical_ranking = []
+                canonical_parse_failed = False
+                canonical_low_coverage = False
+                if canonical_response is None:
+                    # Transport errors and unavailable responses are handled
+                    # below by skipping this weight update.
+                    pass
+                elif not isinstance(canonical_response, dict):
+                    canonical_parse_failed = True
+                else:
+                    ranking = canonical_response.get("ranking")
+                    if not isinstance(ranking, list):
+                        canonical_parse_failed = True
+                    elif not ranking:
+                        canonical_low_coverage = True
+                    else:
+                        v_count = canonical_response.get("validator_count", 0)
+                        stake_total = canonical_response.get(
+                            "total_stake_considered", 0.0
+                        )
+                        min_total_stake = (
+                            canonical_min_validator_count
+                            * canonical_min_validator_stake
+                        )
+                        if not isinstance(v_count, int) or v_count < canonical_min_validator_count:
+                            canonical_low_coverage = True
+                        elif not isinstance(stake_total, (int, float)) or stake_total < min_total_stake:
+                            canonical_low_coverage = True
+                        else:
+                            for entry in ranking:
+                                if not isinstance(entry, dict):
+                                    canonical_parse_failed = True
+                                    break
+                                raw = entry.get("miner_hotkey")
+                                if not isinstance(raw, str):
+                                    canonical_parse_failed = True
+                                    break
+                                # Trim accidental whitespace without changing
+                                # ss58 casing.
+                                candidate = raw.strip()
+                                if not candidate:
+                                    canonical_parse_failed = True
+                                    break
+
+                                # Keep a validator-side quorum check for
+                                # rolling upgrades and skip only the affected
+                                # entry.
+                                entry_count = entry.get("validator_count", 0)
+                                if (
+                                    not isinstance(entry_count, int)
+                                    or entry_count < canonical_min_validator_count
+                                ):
+                                    continue
+                                canonical_ranking.append(candidate)
+
+                            if not canonical_parse_failed and not canonical_ranking:
+                                # No ranked miner met the validator-side quorum.
+                                canonical_low_coverage = True
+
+                if canonical_parse_failed:
+                    bt.logging.error(
+                        f"Canonical ranking response malformed "
+                        f"(shape={type(canonical_response).__name__}); "
+                        "skipping weight submission. Check "
+                        "/scoring/canonical-ranking."
+                    )
+                    return
+                elif canonical_low_coverage:
+                    bt.logging.error(
+                        f"Canonical ranking has insufficient coverage for "
+                        f"round {round_id} "
+                        f"(validators={canonical_response.get('validator_count')}, "
+                        f"top_validators="
+                        f"{(canonical_response.get('ranking') or [{}])[0].get('validator_count')}, "
+                        f"stake={canonical_response.get('total_stake_considered')}; "
+                        f"min={canonical_min_validator_count} validators / "
+                        f"{canonical_min_validator_stake} TAO each). Skipping "
+                        "weight submission to avoid validator divergence."
+                    )
+                    return
+                elif canonical_ranking:
+                    bt.logging.info(
+                        f"Canonical ranking top={canonical_ranking[0][:16]}... "
+                        f"({len(canonical_ranking)} candidates) for "
+                        f"round {round_id} "
+                        f"(coverage: {canonical_response.get('validator_count')} "
+                        f"validators, "
+                        f"{canonical_response.get('total_stake_considered'):.0f} TAO)"
+                    )
+                    local_eligible_positive = {
+                        hk
+                        for hk in tracked_miners
+                        if self.score_tracker.is_eligible(hk)
+                        and self.score_tracker.ema_scores.get(hk, 0.0) > 0
+                    }
+                    if not any(hk in local_eligible_positive for hk in canonical_ranking):
+                        bt.logging.error(
+                            "Canonical ranking has no locally eligible "
+                            "candidate — skipping weight submission to avoid "
+                            "local-only winner selection."
+                        )
+                        return
+                else:
+                    bt.logging.error(
+                        f"Canonical ranking unavailable for round "
+                        f"{round_id} — skipping weight submission to avoid "
+                        "validator divergence"
+                    )
+                    return
 
             weights = self.score_tracker.get_winner_heavy_pruning_dust_weights(
                 tracked_miners,
@@ -1249,6 +1472,7 @@ class Validator:
                 winner_weight=winner_weight,
                 dust_top_n=dust_top_n,
                 dust_decay=dust_decay,
+                canonical_ranking=canonical_ranking or None,
             )
 
             burn_hotkey = ""

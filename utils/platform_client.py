@@ -148,6 +148,50 @@ class PlatformClient:
         except Exception:
             return None
 
+    async def get_canonical_ranking(
+        self,
+        round_id: Optional[str] = None,
+        top_n: int = 10,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch stake-weighted canonical ranking for a round.
+
+        Used by validator weight tracking as a tiebreak signal when local EMA
+        leaders are close. Returns the full response including the ranked list of
+        ``{miner_hotkey, consensus_ema, validator_count, stake_share}``.
+
+        Platform serves this only after the late-score grace period. Returns
+        ``None`` on any error; the validator treats that as canonical
+        unavailable for the round.
+
+        Args:
+            round_id: optional explicit round; defaults to platform's latest
+                completed round.
+            top_n: number of top miners to retrieve.
+        """
+        try:
+            params: Dict[str, Any] = {"top_n": top_n}
+            if round_id:
+                params["round_id"] = round_id
+            async with self._get_client() as client:
+                # Keep the canonical lookup bounded on the weight-setting
+                # path. The endpoint is expected to be cached after the
+                # final-score gate opens.
+                for attempt in range(3):
+                    response = await client.get(
+                        "/scoring/canonical-ranking",
+                        params=params,
+                        timeout=10.0,
+                    )
+                    if response.status_code == 200:
+                        return response.json()
+                    if response.status_code == 425 and attempt < 2:
+                        await asyncio.sleep(5.0)
+                        continue
+                    break
+                return None
+        except Exception:
+            return None
+
 
 class MinerPlatformClient(PlatformClient):
     """Platform client for miners."""
@@ -731,8 +775,8 @@ class ValidatorPlatformClient(PlatformClient):
     ) -> Dict[str, Any]:
         """Fetch scores for miners not personally covered this round (validator only).
 
-        Must be called after the scoring window has closed. The platform enforces
-        this gate (returns 425 Too Early if the window is still open).
+        Must be called after the scoring window and late-score grace have closed.
+        The platform enforces this gate (returns 425 Too Early until final).
 
         Args:
             round_id: The round to fetch backfill scores for.
