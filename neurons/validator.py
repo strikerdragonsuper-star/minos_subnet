@@ -1340,9 +1340,58 @@ class Validator:
                 )
                 return
 
+            if len(self.metagraph.hotkeys) <= burn_uid:
+                bt.logging.error(
+                    f"Burn UID {burn_uid} unavailable in metagraph — skipping "
+                    "weight submission to avoid renormalizing miner weights"
+                )
+                return
+
+            burn_hotkey = self.metagraph.hotkeys[burn_uid]
+
+            # Build current chain recipient map before ranking. ScoreTracker can
+            # retain EMA for hotkeys that have since deregistered or become
+            # validators; those must not be eligible for winner/dust selection.
+            # Burn hotkey is always included so any unallocated remainder can be
+            # submitted explicitly instead of relying on SDK normalization.
+            hotkey_to_uid = {}
+            for uid in range(len(self.metagraph.hotkeys)):
+                hk = self.metagraph.hotkeys[uid]
+                if hk == burn_hotkey:
+                    hotkey_to_uid[hk] = uid
+                    continue
+                if uid == self.my_subnet_uid:
+                    continue
+                if self.metagraph.validator_permit[uid]:
+                    continue
+                hotkey_to_uid[hk] = uid
+
+            chain_eligible_tracked_miners = [
+                hk
+                for hk in tracked_miners
+                if hk in hotkey_to_uid and hk != burn_hotkey
+            ]
+            dropped_tracked = [
+                hk
+                for hk in tracked_miners
+                if hk not in chain_eligible_tracked_miners and hk != burn_hotkey
+            ]
+            positive_dropped = [
+                hk
+                for hk in dropped_tracked
+                if self.score_tracker.ema_scores.get(hk, 0.0) > 0
+            ]
+            if positive_dropped:
+                sample = ", ".join(hk[:16] for hk in positive_dropped[:5])
+                bt.logging.warning(
+                    f"Excluding {len(positive_dropped)} tracked hotkey(s) from "
+                    f"weight ranking because they are not current chain miner "
+                    f"recipients (sample: {sample})"
+                )
+
             canonical_ranking = None
             canonical_needed = self.score_tracker.needs_canonical_tiebreak(
-                tracked_miners,
+                chain_eligible_tracked_miners,
                 submission_times,
             )
             if canonical_needed:
@@ -1446,7 +1495,7 @@ class Validator:
                     )
                     local_eligible_positive = {
                         hk
-                        for hk in tracked_miners
+                        for hk in chain_eligible_tracked_miners
                         if self.score_tracker.is_eligible(hk)
                         and self.score_tracker.ema_scores.get(hk, 0.0) > 0
                     }
@@ -1466,7 +1515,7 @@ class Validator:
                     return
 
             weights = self.score_tracker.get_winner_heavy_pruning_dust_weights(
-                tracked_miners,
+                chain_eligible_tracked_miners,
                 submission_times,
                 burn_rate=burn_rate,
                 winner_weight=winner_weight,
@@ -1475,23 +1524,13 @@ class Validator:
                 canonical_ranking=canonical_ranking or None,
             )
 
-            burn_hotkey = ""
             burn_weight = max(0.0, 1.0 - sum(weights.values()))
-            if burn_weight > 1e-12 and len(self.metagraph.hotkeys) <= burn_uid:
-                bt.logging.error(
-                    f"Burn UID {burn_uid} unavailable in metagraph — skipping "
-                    "weight submission to avoid renormalizing miner weights"
-                )
-                return
-
-            if len(self.metagraph.hotkeys) > burn_uid:
-                burn_hotkey = self.metagraph.hotkeys[burn_uid]
-                weights[burn_hotkey] = weights.get(burn_hotkey, 0.0) + burn_weight
-                bt.logging.info(
-                    f"burn {burn_weight * 100:.2f}% -> uid {burn_uid} "
-                    f"({burn_hotkey[:12]}...), winner={winner_weight:.4f}, "
-                    f"dust_top_n={dust_top_n}, dust_decay={dust_decay:.2f}"
-                )
+            weights[burn_hotkey] = weights.get(burn_hotkey, 0.0) + burn_weight
+            bt.logging.info(
+                f"burn {burn_weight * 100:.2f}% -> uid {burn_uid} "
+                f"({burn_hotkey[:12]}...), winner={winner_weight:.4f}, "
+                f"dust_top_n={dust_top_n}, dust_decay={dust_decay:.2f}"
+            )
 
             # Log weight distribution (mode-aware)
             stats = self.score_tracker.get_stats()
@@ -1530,23 +1569,26 @@ class Validator:
                 bt.logging.info("Skipping on-chain set_weights — not registered (demo mode)")
                 return
 
-            # Build hotkey -> uid map. Burn hotkey always passes (otherwise
-            # self-vote / validator filters strip it).
-            hotkey_to_uid = {}
-            for uid in range(len(self.metagraph.hotkeys)):
-                hk = self.metagraph.hotkeys[uid]
-                if hk == burn_hotkey:
-                    hotkey_to_uid[hk] = uid
-                    continue
-                if uid == self.my_subnet_uid:
-                    continue
-                if self.metagraph.validator_permit[uid]:
-                    continue
-                hotkey_to_uid[hk] = uid
-
             chain_weights = {hk: w for hk, w in weights.items() if hk in hotkey_to_uid}
             if not chain_weights:
                 bt.logging.warning("No tracked miners on chain — skipping chain set_weights")
+                return
+
+            chain_total = sum(chain_weights.values())
+            missing_weight = 1.0 - chain_total
+            if missing_weight > 1e-12:
+                chain_weights[burn_hotkey] = (
+                    chain_weights.get(burn_hotkey, 0.0) + missing_weight
+                )
+                bt.logging.warning(
+                    f"Added post-filter remainder {missing_weight:.8f} to burn "
+                    f"uid {burn_uid} before chain submission"
+                )
+            elif missing_weight < -1e-6:
+                bt.logging.error(
+                    f"Chain weight vector exceeds 1.0 by {-missing_weight:.8f} "
+                    "— skipping weight submission"
+                )
                 return
 
             loop = asyncio.get_running_loop()
