@@ -49,18 +49,19 @@ MINER_DOCKER_IMAGES = {
     "deepvariant": [
         "google/deepvariant:1.5.0",
     ],
-    "freebayes": [
-        "staphb/freebayes:1.3.7",
-    ],
     "bcftools": [
         "quay.io/biocontainers/bcftools:1.20--h8b25389_0",
     ],
+    # freebayes is intentionally absent — see DEPRECATED_TEMPLATES in
+    # templates/__init__.py and the runtime block in neurons/miner.py.
 }
 
 VALIDATOR_DOCKER_IMAGES = [
     "genonet/hap-py@sha256:03acabe84bbfba35f5a7234129d524c563f5657e1f21150a2ea2797f8e6d05f2",
     "broadinstitute/gatk:4.5.0.0",
     "google/deepvariant:1.5.0",
+    # Retained only so validators can replay in-flight pre-cutover rounds;
+    # removed in a follow-up release.
     "staphb/freebayes:1.3.7",
     "quay.io/biocontainers/bcftools:1.20--h8b25389_0",
     "quay.io/biocontainers/samtools:1.20--h50ea8bc_0",
@@ -217,6 +218,16 @@ def check_docker_daemon() -> Check:
 
 def check_docker_images(role: str, template: Optional[str]) -> List[Check]:
     if role == "miner" and template:
+        # Surface deprecated miner templates as a FAIL so this matches the
+        # runtime block in neurons/miner.py — keeps `verify`/`status` output
+        # honest instead of pretending freebayes is a valid miner choice.
+        from templates import DEPRECATED_TEMPLATES  # local import to avoid cycle
+        if template in DEPRECATED_TEMPLATES:
+            return [Check(
+                name="Variant caller template",
+                status=Status.FAIL,
+                detail=f"'{template}' is deprecated; {DEPRECATED_TEMPLATES[template]}",
+            )]
         images = MINER_DOCKER_IMAGES.get(template, [])
     elif role == "miner":
         images = MINER_DOCKER_IMAGES.get("gatk", [])

@@ -70,12 +70,16 @@ echo "Docker images:"
 MINER_IMAGES=(
     "broadinstitute/gatk:4.5.0.0"
     "google/deepvariant:1.5.0"
-    "staphb/freebayes:1.3.7"
     "quay.io/biocontainers/bcftools:1.20--h8b25389_0"
     "quay.io/biocontainers/samtools:1.20--h50ea8bc_0"
 )
 VALIDATOR_IMAGES=(
     "genonet/hap-py@sha256:03acabe84bbfba35f5a7234129d524c563f5657e1f21150a2ea2797f8e6d05f2"
+)
+# Images required only for replaying historical pre-cutover rounds. Will be
+# removed in a follow-up release once those rounds finish scoring.
+DEPRECATED_VALIDATOR_IMAGES=(
+    "staphb/freebayes:1.3.7"
 )
 
 check_images() {
@@ -90,12 +94,24 @@ check_images() {
     done
 }
 
+check_deprecated_images() {
+    for img in "$@"; do
+        short="${img##*/}"
+        if docker image inspect "$img" &>/dev/null; then
+            warn "$short present (deprecated; retained only for historical rounds)"
+        else
+            pass "$short not pulled (deprecated; not required for new rounds)"
+        fi
+    done
+}
+
 if [[ "$ROLE" == "--miner" ]]; then
     check_images "${MINER_IMAGES[@]}"
     echo -e "  ${YELLOW}Note:${NC} You only need the image for your chosen variant caller."
 elif [[ "$ROLE" == "--validator" ]]; then
     check_images "${VALIDATOR_IMAGES[@]}"
     check_images "${MINER_IMAGES[@]}"
+    check_deprecated_images "${DEPRECATED_VALIDATOR_IMAGES[@]}"
 fi
 
 # --- Wallet ---

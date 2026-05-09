@@ -35,6 +35,7 @@ from utils.config_loader import extract_tool_options, get_tool_version
 
 # Template system for pluggable variant callers
 from templates import (
+    DEPRECATED_TEMPLATES,
     get_template_path,
     load_template,
 )
@@ -146,11 +147,22 @@ class Miner:
         """Setup variant caller from MINER_TEMPLATE env var."""
         self.variant_caller = os.getenv("MINER_TEMPLATE", "").lower() or MINER_CONFIG.get("default_caller", "gatk")
 
+        # Refuse to run with a deprecated template. The runner is still
+        # registered (validators need it for in-flight pre-cutover rounds),
+        # so a stray MINER_TEMPLATE value would otherwise resolve, run, and
+        # waste compute on every round before the platform's HTTP 400.
+        if self.variant_caller in DEPRECATED_TEMPLATES:
+            bt.logging.error(
+                f"MINER_TEMPLATE='{self.variant_caller}' is deprecated. "
+                f"{DEPRECATED_TEMPLATES[self.variant_caller]}"
+            )
+            sys.exit(1)
+
         # Validate template exists
         try:
             get_template_path(self.variant_caller)
         except (ValueError, FileNotFoundError):
-            bt.logging.error(f"Invalid template '{self.variant_caller}'. Available: gatk, deepvariant, freebayes, bcftools")
+            bt.logging.error(f"Invalid template '{self.variant_caller}'. Available: gatk, deepvariant, bcftools")
             sys.exit(1)
 
     @staticmethod
@@ -162,7 +174,7 @@ class Miner:
         parser.add_argument(
             "--variant_caller",
             type=str,
-            choices=["gatk", "deepvariant", "freebayes", "bcftools"],
+            choices=["gatk", "deepvariant", "bcftools"],
             default=MINER_CONFIG.get("default_caller", "gatk"),
             help="Variant calling template",
         )
@@ -541,8 +553,6 @@ class Miner:
                 base_config["gatk_options"] = tool_options
             elif self.variant_caller == "deepvariant":
                 base_config["deepvariant_options"] = tool_options
-            elif self.variant_caller == "freebayes":
-                base_config["freebayes_options"] = tool_options
             elif self.variant_caller == "bcftools":
                 base_config["bcftools_options"] = tool_options
 
@@ -557,8 +567,6 @@ class Miner:
                 base_config["gatk_options"] = {"min_base_quality_score": 10}
             elif self.variant_caller == "deepvariant":
                 base_config["deepvariant_options"] = {"model_type": "WGS"}
-            elif self.variant_caller == "freebayes":
-                base_config["freebayes_options"] = {"min_mapping_quality": 1}
             elif self.variant_caller == "bcftools":
                 base_config["bcftools_options"] = {"min_BQ": 1}
 

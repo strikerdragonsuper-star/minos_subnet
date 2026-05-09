@@ -51,7 +51,9 @@ def extract_tool_options(tool: str) -> Dict[str, Any]:
     Load tool-specific quality parameters from .conf file.
 
     Args:
-        tool: Tool name (gatk, deepvariant, freebayes, bcftools)
+        tool: Tool name (gatk, deepvariant, bcftools).
+              freebayes still resolves through TOOL_VERSIONS so historical
+              rounds can be parsed; new submissions are blocked at the platform.
 
     Returns:
         Dict with parameter names and their values.
@@ -97,7 +99,7 @@ def get_tool_version(tool: str) -> str:
 
 
 if __name__ == "__main__":
-    for tool in ["gatk", "deepvariant", "freebayes", "bcftools"]:
+    for tool in ["gatk", "deepvariant", "bcftools"]:
         print(f"\n{tool.upper()} Config:")
         print("=" * 60)
         try:

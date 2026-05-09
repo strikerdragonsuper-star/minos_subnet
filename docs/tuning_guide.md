@@ -66,8 +66,9 @@ Four tools are supported. Pick based on your hardware and willingness to tune.
 |-----------------------|----------|---------|------------|---------------------------------|
 | GATK HaplotypeCaller  | Highest  | Slowest | Most knobs | Maximizing score, if you have time to tune |
 | DeepVariant           | High     | Medium  | Few knobs  | Consistent high scores with minimal tuning |
-| FreeBayes             | Good     | Medium  | Moderate   | Good balance of speed and accuracy |
 | bcftools mpileup      | Lower    | Fastest | Moderate   | Quick testing, low-resource setups |
+
+> **FreeBayes was deprecated on 2026-05-09 16:00 UTC.** The platform rejects new freebayes submissions; switch to GATK, DeepVariant, or BCFtools.
 
 **Recommendation:** Start with DeepVariant if you want reliable scores fast. Move to GATK if you want to squeeze out every point and are willing to iterate.
 
@@ -96,14 +97,15 @@ Only quality-related parameters are exposed. Infrastructure params (threads, mem
 
 DeepVariant is intentionally less tunable — it relies on its trained model. Your main lever is `min_mapping_quality`. The defaults are generally strong.
 
-### FreeBayes
+### FreeBayes (DEPRECATED 2026-05-09 16:00 UTC)
+
+> **No longer accepted by the platform.** New submissions with `tool_name=freebayes`
+> return HTTP 400. The reference below is retained for historical context only.
 
 | Parameter                | Default | Effect                                                                         |
 |--------------------------|---------|--------------------------------------------------------------------------------|
 | `min_alternate_fraction` | 0.05    | Minimum variant allele frequency to call. Lower = more sensitive but more FPs. |
 | `min_mapping_quality`    | 1       | Filter poorly mapped reads. Consider raising to 10-20.                         |
-
-**Tuning priority:** `min_alternate_fraction` is your main lever. The default 0.05 is sensitive — raise toward 0.1-0.2 if your FP rate is too high, or keep it low if completeness is suffering.
 
 ### bcftools mpileup
 
@@ -193,8 +195,8 @@ Config files live in your miner's `configs/` directory:
 ```
 configs/gatk.conf
 configs/deepvariant.conf
-configs/freebayes.conf
 configs/bcftools.conf
+configs/freebayes.conf      # DEPRECATED 2026-05-09
 ```
 
 ### Format
@@ -223,11 +225,8 @@ model_type=WGS
 min_mapping_quality=10
 ```
 
-**FreeBayes:**
-```ini
-min_alternate_fraction=0.05
-min_mapping_quality=1
-```
+> Note: FreeBayes minimal-config example was removed because the tool was deprecated on 2026-05-09 16:00 UTC.
+
 
 ---
 

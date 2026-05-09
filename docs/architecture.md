@@ -8,7 +8,7 @@ Minos is a Bittensor subnet (SN107) that creates a decentralised market for geno
 
 Genomic variant calling accuracy is critical for real-world genomics, yet benchmarking is fragmented and untrustworthy. Minos turns this into a continuous, incentivized benchmarking network:
 
-- **Miners** run variant-calling pipelines (GATK, DeepVariant, FreeBayes, or BCFtools) and earn rewards proportional to their accuracy.
+- **Miners** run variant-calling pipelines (GATK, DeepVariant, or BCFtools — freebayes deprecated 2026-05-09 16:00 UTC) and earn rewards proportional to their accuracy.
 - **Validators** re-run miner configurations against private hold-out data and score results with hap.py — no trust required.
 - **The platform** generates synthetic benchmark BAMs (GIAB + HelixForge-inserted mutations) and coordinates rounds.
 
@@ -90,8 +90,8 @@ All API calls are authenticated via canonical request signing. Each request incl
 | --- | --- |
 | `gatk` | `broadinstitute/gatk:4.5.0.0` |
 | `deepvariant` | `google/deepvariant:1.5.0` |
-| `freebayes` | `staphb/freebayes:1.3.7` |
 | `bcftools` | `quay.io/biocontainers/bcftools:1.20--h8b25389_0` |
+| `freebayes` | `staphb/freebayes:1.3.7` (DEPRECATED 2026-05-09; runner retained while in-flight pre-cutover rounds finish scoring, then removed in a follow-up release) |
 
 Miners tune quality parameters via `configs/<tool>.conf`. Infrastructure parameters (`threads`, `memory_gb`, `timeout`, `ref_build`, `num_threads`) are stripped before submission and cannot influence scoring.
 
@@ -187,7 +187,7 @@ minos_subnet/
 ├── templates/
 │   ├── gatk.py            # GATK HaplotypeCaller template
 │   ├── deepvariant.py     # Google DeepVariant template
-│   ├── freebayes.py       # FreeBayes template
+│   ├── freebayes.py       # FreeBayes template (DEPRECATED 2026-05-09)
 │   ├── bcftools.py        # BCFtools mpileup/call template
 │   ├── _common.py         # Shared template utilities
 │   └── tool_params.py     # Parameter definitions and validation
@@ -205,7 +205,7 @@ minos_subnet/
 ├── configs/
 │   ├── gatk.conf          # Miner-tunable GATK quality parameters
 │   ├── deepvariant.conf   # Miner-tunable DeepVariant parameters
-│   ├── freebayes.conf     # Miner-tunable FreeBayes parameters
+│   ├── freebayes.conf     # Miner-tunable FreeBayes parameters (DEPRECATED 2026-05-09)
 │   └── bcftools.conf      # Miner-tunable BCFtools parameters
 ├── docs/
 │   ├── architecture.md    # This document

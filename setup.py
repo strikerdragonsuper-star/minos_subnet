@@ -102,12 +102,13 @@ MINER_DOCKER_IMAGES = {
     "deepvariant": [
         "google/deepvariant:1.5.0",
     ],
-    "freebayes": [
-        "staphb/freebayes:1.3.7",
-    ],
     "bcftools": [
         "quay.io/biocontainers/bcftools:1.20--h8b25389_0",
     ],
+    # freebayes deprecated 2026-05-09 16:00 UTC. Image stays in
+    # VALIDATOR_DOCKER_IMAGES so validators can score any in-flight
+    # pre-cutover freebayes submissions; it will be removed in a
+    # follow-up release once those rounds have settled.
 }
 
 VALIDATOR_DOCKER_IMAGES = [
@@ -605,7 +606,7 @@ class SetupWizard:
         if self.state.role != "miner":
             self.console.print("  [dim]Template selection is for miners only.[/]")
             self.console.print(
-                "  [dim]Validators re-run all miner tool configs (GATK, DeepVariant, FreeBayes, BCFtools) and score with hap.py.[/]"
+                "  [dim]Validators re-run all miner tool configs (GATK, DeepVariant, BCFtools) and score with hap.py.[/]"
             )
             self.console.print(
                 "  [dim]All required Docker images will be configured in the next step.[/]"
@@ -620,10 +621,6 @@ class SetupWizard:
             questionary.Choice(
                 "DeepVariant             (GPU-accelerated, Google AI)",
                 value="deepvariant",
-            ),
-            questionary.Choice(
-                "FreeBayes               (Bayesian caller, lightweight)",
-                value="freebayes",
             ),
             questionary.Choice(
                 "BCFtools                (minimal, fastest)",
@@ -646,13 +643,12 @@ class SetupWizard:
         info = {
             "gatk": ("broadinstitute/gatk:4.5.0.0", "~4 GB", "10-20 min/window"),
             "deepvariant": ("google/deepvariant:1.5.0", "~3 GB", "5-15 min (GPU) / 15-30 min (CPU)"),
-            "freebayes": ("staphb/freebayes:1.3.7", "~500 MB", "5-15 min/window"),
             "bcftools": ("quay.io/biocontainers/bcftools:1.20--h8b25389_0", "~200 MB", "2-5 min/window"),
         }
         image, size, timing = info[template]
         self.console.print(f"  Primary image: [cyan]{image}[/] ({size})")
         self.console.print(f"  Typical runtime: {timing}")
-        self.console.print(f"  [dim]All 4 tool images will be pulled so you can switch templates later.[/]")
+        self.console.print(f"  [dim]All 3 tool images will be pulled so you can switch templates later.[/]")
 
         return StepResult()
 

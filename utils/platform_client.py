@@ -257,7 +257,9 @@ class MinerPlatformClient(PlatformClient):
 
         Args:
             round_id: The round ID to submit to
-            tool_name: One of "gatk", "deepvariant", "freebayes", "bcftools"
+            tool_name: One of "gatk", "deepvariant", "bcftools".
+                       (freebayes deprecated 2026-05-09 16:00 UTC; platform
+                       returns HTTP 400 for new freebayes submissions.)
             tool_config: Full tool configuration as JSON
             variant_count: Optional number of variants called
             runtime_seconds: Optional runtime in seconds

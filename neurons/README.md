@@ -31,7 +31,7 @@ A miner receives genomic data (DNA sequencing files) and finds genetic variants 
 
 3. **Process the Data**
    - Download the BAM file (raw genomic data) from platform presigned URL
-   - Run variant calling tool  (GATK, DeepVariant, FreeBayes, or BCFtools) locally with your preferred configs to ensure quality output
+   - Run variant calling tool  (GATK, DeepVariant, or BCFtools) locally with your preferred configs to ensure quality output
    - This analyzes the DNA data and identifies variants
 
 4. **Return Results**
@@ -86,7 +86,7 @@ python -m neurons.miner
 | `WALLET_HOTKEY` | default | Bittensor hotkey name |
 | `PLATFORM_URL` | https://api.theminos.ai | Platform API URL |
 | `PLATFORM_TIMEOUT` | 60 | Platform API request timeout (seconds) |
-| `MINER_TEMPLATE` | gatk | Variant calling tool: `gatk`, `deepvariant`, `freebayes`, or `bcftools` |
+| `MINER_TEMPLATE` | gatk | Variant calling tool: `gatk`, `deepvariant`, or `bcftools` (freebayes deprecated 2026-05-09) |
 | `STORAGE_PRIMARY_BACKEND` | hippius | Storage preference: `hippius` tries Hippius SN75 first (Bittensor decentralized, recommended). `aws_s3` reverses the order. |
 
 ## Validator (validator.py)

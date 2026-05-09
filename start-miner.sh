@@ -22,7 +22,7 @@ show_help() {
     echo "Options:"
     echo "  --wallet-name <name>        Wallet name"
     echo "  --wallet-hotkey <name>      Hotkey name"
-    echo "  --miner-template <tool>     Variant caller: gatk, deepvariant, freebayes, bcftools"
+    echo "  --miner-template <tool>     Variant caller: gatk, deepvariant, bcftools"
     echo "  --storage <backend>         Fetch order: hippius (default) or aws_s3 (R2/AWS first)"
     echo "  --setup                     Re-run interactive setup wizard"
     echo "  --help                      Show this help message"
@@ -31,7 +31,7 @@ show_help() {
     echo "  bash start-miner.sh                                    # First run: interactive setup"
     echo "  bash start-miner.sh --wallet-name miner --miner-template deepvariant"
     echo "  bash start-miner.sh --setup                            # Re-run setup wizard"
-    echo "  bash start-miner.sh --miner-template freebayes         # Change tool and restart"
+    echo "  bash start-miner.sh --miner-template bcftools          # Change tool and restart"
     exit 0
 }
 
@@ -109,6 +109,17 @@ if [ -f .env ] && [ "$RUN_SETUP" = false ]; then
         CHANGED=true
     fi
     if [ -n "$FLAG_MINER_TEMPLATE" ]; then
+        case "$FLAG_MINER_TEMPLATE" in
+            gatk|deepvariant|bcftools) ;;
+            freebayes)
+                echo -e "${RED}freebayes was deprecated 2026-05-09 16:00 UTC. Choose gatk, deepvariant, or bcftools.${NC}"
+                exit 1
+                ;;
+            *)
+                echo -e "${RED}invalid --miner-template '$FLAG_MINER_TEMPLATE'. Choose gatk, deepvariant, or bcftools.${NC}"
+                exit 1
+                ;;
+        esac
         sed -i.bak "s/^MINER_TEMPLATE=.*/MINER_TEMPLATE=$FLAG_MINER_TEMPLATE/" .env && rm -f .env.bak
         MINER_TEMPLATE="$FLAG_MINER_TEMPLATE"
         CHANGED=true
@@ -211,8 +222,8 @@ if [ ! -f .env ] || [ "$RUN_SETUP" = true ]; then
     # Tool selection — highlight current default
     echo ""
     echo -e "${BLUE}[2/2] Select variant calling tool:${NC}"
-    TOOLS=("gatk" "deepvariant" "freebayes" "bcftools")
-    LABELS=("GATK HaplotypeCaller" "DeepVariant" "FreeBayes" "BCFtools")
+    TOOLS=("gatk" "deepvariant" "bcftools")
+    LABELS=("GATK HaplotypeCaller" "DeepVariant" "BCFtools")
     for i in "${!TOOLS[@]}"; do
         MARKER=""
         [ "${TOOLS[$i]}" = "$DEFAULT_MINER_TEMPLATE" ] && MARKER=" ${GREEN}(current)${NC}"
@@ -225,13 +236,12 @@ if [ ! -f .env ] || [ "$RUN_SETUP" = true ]; then
         [ "${TOOLS[$i]}" = "$DEFAULT_MINER_TEMPLATE" ] && DEFAULT_TOOL_NUM=$((i+1))
     done
 
-    read -p "  Choice (1/2/3/4) [$DEFAULT_TOOL_NUM]: " TOOL_CHOICE
+    read -p "  Choice (1/2/3) [$DEFAULT_TOOL_NUM]: " TOOL_CHOICE
 
     case ${TOOL_CHOICE:-$DEFAULT_TOOL_NUM} in
         1) MINER_TEMPLATE="gatk" ;;
         2) MINER_TEMPLATE="deepvariant" ;;
-        3) MINER_TEMPLATE="freebayes" ;;
-        4) MINER_TEMPLATE="bcftools" ;;
+        3) MINER_TEMPLATE="bcftools" ;;
         *) MINER_TEMPLATE="$DEFAULT_MINER_TEMPLATE" ;;
     esac
 

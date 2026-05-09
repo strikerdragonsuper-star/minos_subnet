@@ -11,7 +11,7 @@
 #      and attempts to submit — the platform responds with "demo complete"
 #   5. This script inspects the output VCF and prints a summary
 #
-# Usage: bash scripts/demo.sh [--template gatk|deepvariant|freebayes|bcftools]
+# Usage: bash scripts/demo.sh [--template gatk|deepvariant|bcftools]
 #        Run from the minos_subnet/ directory.
 set -euo pipefail
 
@@ -46,7 +46,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            echo "Usage: bash scripts/demo.sh [--template gatk|deepvariant|freebayes|bcftools]"
+            echo "Usage: bash scripts/demo.sh [--template gatk|deepvariant|bcftools]"
             echo ""
             echo "Runs a single demo round to verify your miner setup."
             echo "If --template is not specified, the value from .env is used (default: gatk)."
@@ -54,7 +54,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo -e "${RED}Unknown argument: $1${NC}"
-            echo "Usage: bash scripts/demo.sh [--template gatk|deepvariant|freebayes|bcftools]"
+            echo "Usage: bash scripts/demo.sh [--template gatk|deepvariant|bcftools]"
             exit 1
             ;;
     esac
@@ -63,10 +63,10 @@ done
 # Validate template choice if provided
 if [[ -n "$TEMPLATE" ]]; then
     case "$TEMPLATE" in
-        gatk|deepvariant|freebayes|bcftools) ;;
+        gatk|deepvariant|bcftools) ;;
         *)
             echo -e "${RED}Invalid template: $TEMPLATE${NC}"
-            echo "Valid options: gatk, deepvariant, freebayes, bcftools"
+            echo "Valid options: gatk, deepvariant, bcftools"
             exit 1
             ;;
     esac
@@ -425,7 +425,7 @@ echo -e "  ${BOLD}Tips to improve your score:${NC}"
 echo -e "    - Tune parameters in ${CYAN}configs/$ACTIVE_TEMPLATE.conf${NC}"
 echo -e "    - Try different variant callers (GATK and DeepVariant score highest)"
 echo -e "    - Ensure enough RAM is available for your tool"
-echo -e "      (DeepVariant: 8GB+, GATK: 4GB+, bcftools/freebayes: 2GB+)"
+echo -e "      (DeepVariant: 8GB+, GATK: 4GB+, bcftools: 2GB+)"
 echo ""
 
 # ---------------------------------------------------------------------------

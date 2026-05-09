@@ -212,7 +212,7 @@ await client.submit_score(
    |
 2. download_file_with_fallback() -> fetch BAM
    |
-3. execute_template() (GATK/DeepVariant/FreeBayes/BCFtools via Docker)
+3. execute_template() (GATK/DeepVariant/BCFtools via Docker)
    |
 4. MinerPlatformClient.submit_config()
 ```

@@ -22,6 +22,14 @@ TEMPLATES = {
     "bcftools": "bcftools.py",
 }
 
+# Templates retained in the registry so validators can score in-flight
+# pre-cutover submissions, but rejected when chosen by miners. Miner
+# entry-points (`neurons/miner.py`, `start-miner.sh`) check this set and
+# refuse to run; the platform also returns HTTP 400 for new submissions.
+DEPRECATED_TEMPLATES = {
+    "freebayes": "Deprecated 2026-05-09 16:00 UTC. Use gatk, deepvariant, or bcftools.",
+}
+
 DEFAULT_TEMPLATE = "gatk"
 
 

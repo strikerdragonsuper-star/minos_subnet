@@ -81,7 +81,7 @@ minos_subnet/
 ├── templates/                # Variant-calling tool templates
 │   ├── gatk.py               # GATK HaplotypeCaller template
 │   ├── deepvariant.py        # Google DeepVariant template
-│   ├── freebayes.py          # FreeBayes template
+│   ├── freebayes.py          # FreeBayes template (DEPRECATED 2026-05-09; retained so in-flight pre-cutover rounds can still be scored; will be removed in a follow-up release)
 │   ├── bcftools.py           # BCFtools mpileup/call template
 │   ├── _common.py            # Shared template utilities
 │   └── tool_params.py        # Parameter definitions and validation
@@ -99,7 +99,7 @@ minos_subnet/
 ├── configs/                  # Miner-tunable quality parameters
 │   ├── gatk.conf
 │   ├── deepvariant.conf
-│   ├── freebayes.conf
+│   ├── freebayes.conf        # DEPRECATED 2026-05-09; retained for legacy parsing
 │   └── bcftools.conf
 ├── docs/                     # Architecture and integration docs
 │   ├── architecture.md       # System architecture deep dive
@@ -134,7 +134,7 @@ minos_subnet/
 |-----------|-------------|-------|
 | OS | Linux (Ubuntu 20.04+), macOS 13+ | Docker + Bittensor run best on Linux |
 | CPU/RAM (Validator) | ≥8 cores / 32 GB RAM | hap.py scoring benefits from cores |
-| CPU/RAM (Miner) | ≥4 cores / 8–16 GB RAM | 8 GB for BCFtools/FreeBayes, 16 GB for DeepVariant |
+| CPU/RAM (Miner) | ≥4 cores / 8–16 GB RAM | 8 GB for BCFtools, 16 GB for DeepVariant |
 | Disk | ≥60 GB (miner) / ≥100 GB (validator) | Reference: ~2 GB miner, ~14 GB validator (SDF expands ~6×). Plus per-round BAMs (~6 GB each) until cleaned. |
 | Docker | 20.10+ (24.0+ recommended) | Required for GATK, hap.py, bcftools |
 | Python | 3.10+ | We test on 3.12 |
@@ -215,10 +215,12 @@ cp .env.validator.example .env # for validators
 ```bash
 docker pull broadinstitute/gatk:4.5.0.0
 docker pull google/deepvariant:1.5.0
-docker pull staphb/freebayes:1.3.7
 docker pull genonet/hap-py@sha256:03acabe84bbfba35f5a7234129d524c563f5657e1f21150a2ea2797f8e6d05f2
 docker pull quay.io/biocontainers/bcftools:1.20--h8b25389_0
 docker pull quay.io/biocontainers/samtools:1.20--h50ea8bc_0
+# Validators only — the freebayes image is retained until in-flight
+# pre-cutover rounds finish scoring, then removed in a follow-up release:
+# docker pull staphb/freebayes:1.3.7
 ```
 
 > **Note:** The hap.py image is pinned by SHA256 digest for reproducible scoring. The tag `genonet/hap-py:0.3.15` points to the same image but the digest is what validators use internally.
@@ -358,7 +360,7 @@ python -m neurons.miner \
 1. **Registration**: Register with platform via hotkey authentication
 2. **Task Poll**: Poll platform for pending evaluation tasks
 3. **BAM Download**: Fetch benchmark BAM from platform via presigned URL
-4. **Variant Calling**: Run configured variant caller (GATK, DeepVariant, freebayes, or bcftools)
+4. **Variant Calling**: Run configured variant caller (GATK, DeepVariant, or bcftools — freebayes deprecated 2026-05-09)
 5. **Config Submit**: Submit tool config you've used (hyperparameters only based on the template)
 6. **Reward**: Earn alpha based on accuracy score — validators re-run the config to verify
 
@@ -449,7 +451,7 @@ In the warmup phase, miners with scores within 0.5% of each other are tiebroken 
 |-------------------------------|--------------------------------------------|------------------------------------------------------------------------------------------------------------------|
 | `docker: permission denied`   | User not in docker group                   | `sudo usermod -aG docker $USER && newgrp docker`                                                                 |
 | `GATK timeout`                | Insufficient resources                     | Increase threads/memory or timeout                                                                               |
-| DeepVariant OOM / killed      | <16 GB available to the container          | DeepVariant needs ≥16 GB. Free RAM, close other tools, or switch template to GATK/FreeBayes/BCFtools             |
+| DeepVariant OOM / killed      | <16 GB available to the container          | DeepVariant needs ≥16 GB. Free RAM, close other tools, or switch template to GATK/BCFtools                       |
 | `Platform 401 error`          | Invalid sig or unregistered hotkey         | Ensure wallet hotkey is registered on the metagraph                                                              |
 | `No miners available`         | No registered miners                       | Check metagraph for active miners                                                                                |
 | `hap.py zero scores`          | VCF format issues                          | Ensure single-sample VCF output                                                                                  |
