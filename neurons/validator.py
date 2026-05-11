@@ -8,6 +8,7 @@ import shutil
 import traceback
 import subprocess
 from copy import deepcopy
+from collections import defaultdict
 from pathlib import Path
 
 # Add parent directory to path so we can import base and utils
@@ -66,6 +67,28 @@ BITTENSOR_BLOCK_TIME_SECONDS = 12
 MAX_SLEEP_SECONDS = 120
 SCORE_GRACE_SECONDS = int(os.getenv("SCORE_GRACE_SECONDS", "60"))
 SCORE_FINALIZATION_DELAY_SECONDS = int(os.getenv("SCORE_FINALIZATION_DELAY_SECONDS", "5"))
+
+
+def _valid_round_score(value, *, label: str) -> Optional[float]:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        bt.logging.warning(f"Skipping {label}: invalid combined_final={value!r}")
+        return None
+
+    if not math.isfinite(score) or score <= 0.0 or score > 1.0:
+        bt.logging.warning(f"Skipping {label}: out-of-range combined_final={score!r}")
+        return None
+
+    return score
+
+
+def _is_zero_input_advanced_fingerprint(metrics: dict, combined_final: float) -> bool:
+    return (
+        (metrics.get("f1_snp") or 0.0) == 0.0
+        and (metrics.get("f1_indel") or 0.0) == 0.0
+        and 0.24999 <= combined_final <= 0.25001
+    )
 
 
 def auto_scoring_config():
@@ -153,8 +176,7 @@ class Validator:
         self.score_tracker = ScoreTracker(
             alpha=GENOMICS_CONFIG["ema_alpha"],
         )
-        bt.logging.info(f"Score tracker initialized (EMA alpha={GENOMICS_CONFIG['ema_alpha']}, "
-                       f"min_rounds={self.score_tracker.min_rounds})")
+        bt.logging.info("Score tracker initialized (round-only winner policy; EMA disabled)")
 
         self.setup_genomics_components()
         self.setup_platform_client()
@@ -380,11 +402,15 @@ class Validator:
                 print(f"   Region: {round_info.get('region', 'unknown')}", flush=True)
                 print(f"   Submissions: {submission_count}", flush=True)
 
-                await self._score_round_submissions(round_id)
-
-                # Mark round as scored after processing all submissions
-                self.scored_rounds.add(round_id)
-                bt.logging.info(f"Round {round_id}: marked as scored")
+                finalized = await self._score_round_submissions(round_id)
+                if finalized:
+                    self.scored_rounds.add(round_id)
+                    bt.logging.info(f"Round {round_id}: marked as scored")
+                else:
+                    bt.logging.warning(
+                        f"Round {round_id}: not marked scored; will retry until "
+                        "weights/history finalize successfully"
+                    )
 
             return {"next_scoring_window_start": next_scoring_start}
 
@@ -397,7 +423,7 @@ class Validator:
             bt.logging.debug(traceback.format_exc())
             return {"next_scoring_window_start": None}
 
-    async def _score_round_submissions(self, round_id: str):
+    async def _score_round_submissions(self, round_id: str) -> bool:
         """Score submissions for a single round using subset-based assignment.
 
         Flow:
@@ -411,7 +437,7 @@ class Validator:
         rid_check = validate_round_id(round_id)
         if not rid_check["valid"]:
             bt.logging.error(f"_score_round_submissions: invalid round_id '{round_id}': {rid_check['error']}")
-            return
+            return False
 
         try:
             # --- Step 1: Fetch assignment from platform ---
@@ -449,11 +475,11 @@ class Validator:
 
             if not submissions:
                 bt.logging.info(f"Round {round_id}: no submissions")
-                return
+                return False
 
             download_result = self._download_round_files(round_id, round_data)
             if download_result is None:
-                return
+                return False
 
             work_dir = download_result["work_dir"]
             bam_path = download_result["bam_path"]
@@ -473,11 +499,11 @@ class Validator:
             if already_scored:
                 print(f"   Restart recovery: {len(already_scored)} miners already scored, skipping", flush=True)
                 for hotkey, score_info in already_scored.items():
-                    combined_final = score_info.get("combined_final")
+                    combined_final = _valid_round_score(
+                        score_info.get("combined_final"),
+                        label=f"restored score for {hotkey[:16]}...",
+                    )
                     if combined_final is None:
-                        bt.logging.warning(
-                            f"Skipping restored score for {hotkey[:16]}...: missing AdvancedScorer combined_final"
-                        )
                         continue
                     self.score_tracker.update(hotkey, combined_final)
                     scored_hotkeys.append(hotkey)
@@ -554,12 +580,15 @@ class Validator:
             )
             if not finalized:
                 self._restore_score_tracker(score_tracker_snapshot)
+                return False
+            return True
 
         except Exception as e:
             if "score_tracker_snapshot" in locals():
                 self._restore_score_tracker(score_tracker_snapshot)
             bt.logging.error(f"Error scoring round {round_id}: {e}")
             bt.logging.debug(traceback.format_exc())
+            return False
 
     def _score_tracker_snapshot(self) -> dict:
         """Capture ScoreTracker state before applying a round."""
@@ -567,6 +596,8 @@ class Validator:
             "ema_scores": dict(self.score_tracker.ema_scores),
             "last_raw_scores": dict(self.score_tracker.last_raw_scores),
             "round_history": deepcopy(self.score_tracker.round_history),
+            "participation_counts": dict(self.score_tracker._participation_counts),
+            "recorded_round_ids": set(self.score_tracker._recorded_round_ids),
         }
 
     def _restore_score_tracker(self, snapshot: dict):
@@ -574,7 +605,12 @@ class Validator:
         self.score_tracker.ema_scores = dict(snapshot["ema_scores"])
         self.score_tracker.last_raw_scores = dict(snapshot["last_raw_scores"])
         self.score_tracker.round_history = deepcopy(snapshot["round_history"])
-        self.score_tracker._recalculate_participation()
+        self.score_tracker._participation_counts = defaultdict(
+            int, snapshot.get("participation_counts", {})
+        )
+        self.score_tracker._recorded_round_ids = set(
+            snapshot.get("recorded_round_ids", set())
+        )
 
     def _download_round_files(self, round_id, round_data):
         """Download BAM + truth VCF and verify reference files; return paths dict or None on failure."""
@@ -784,11 +820,9 @@ class Validator:
             if not result.get("success"):
                 bt.logging.warning(f"Miner {miner_hotkey[:16]}: tool failed - {result.get('error')}")
                 print(f"   Tool failed: {result.get('error', 'Unknown error')[:100]}", flush=True)
-                # Submit zero score for failed runs
-                await self._submit_miner_score(round_id, miner_hotkey, None, 0)
-                # Still counts as participation (they submitted, tool just failed)
-                self.score_tracker.update(miner_hotkey, 0.0)
-                scored_hotkeys.append(miner_hotkey)
+                bt.logging.warning(
+                    f"Miner {miner_hotkey[:16]}: no valid local score; leaving for backfill"
+                )
                 return
 
             variant_count = result.get("variant_count", 0)
@@ -846,18 +880,42 @@ class Validator:
                 if self.is_registered:
                     bt.logging.warning(f"VCF upload failed for {miner_hotkey[:16]}: {e}")
 
-            # 7. Submit score to platform (with VCF S3 keys)
+            if metrics is None:
+                print("   Scoring failed; no local score recorded", flush=True)
+                bt.logging.warning(
+                    f"Miner {miner_hotkey[:16]}: hap.py returned no valid metrics; leaving for backfill"
+                )
+                return
+
+            # 7. Validate and submit score to platform (with VCF S3 keys)
+            print(f"   SNP F1={metrics.get('f1_snp', 0):.4f}  INDEL F1={metrics.get('f1_indel', 0):.4f}", flush=True)
+            advanced_score = AdvancedScorer.compute_advanced_score(metrics)
+            combined_final = _valid_round_score(
+                advanced_score / 100.0,
+                label=f"local score for {miner_hotkey[:16]}...",
+            )
+            if combined_final is None:
+                print("   Invalid score; no local score recorded", flush=True)
+                return
+            if _is_zero_input_advanced_fingerprint(metrics, combined_final):
+                bt.logging.warning(
+                    f"Miner {miner_hotkey[:16]}: AdvancedScorer all-zero-input fingerprint; "
+                    "not submitting or ranking locally"
+                )
+                print("   Invalid zero-input score; no local score recorded", flush=True)
+                return
+
             score_result = await self._submit_miner_score(
                 round_id, miner_hotkey, metrics, scoring_elapsed,
                 output_vcf_s3_key=output_vcf_s3_key,
                 output_vcf_sha256=output_vcf_sha256_val,
                 happy_output_s3_key=happy_output_s3_key,
             )
-
-            if metrics is None:
-                print("   Scoring failed; submitted score 0.0", flush=True)
-                self.score_tracker.update(miner_hotkey, 0.0)
-                scored_hotkeys.append(miner_hotkey)
+            if not score_result:
+                bt.logging.warning(
+                    f"Miner {miner_hotkey[:16]}: platform did not accept local score; leaving for backfill"
+                )
+                print("   Platform rejected/failed score; no local score recorded", flush=True)
                 return
 
             # 8. Parse and submit variant-level results (non-blocking).
@@ -880,21 +938,17 @@ class Validator:
             except Exception as e:
                 bt.logging.warning(f"Variant results submission failed for {miner_hotkey[:16]}: {e}")
 
-            # Log results and update EMA
-            print(f"   SNP F1={metrics.get('f1_snp', 0):.4f}  INDEL F1={metrics.get('f1_indel', 0):.4f}", flush=True)
-            advanced_score = AdvancedScorer.compute_advanced_score(metrics)
-            combined_final = advanced_score / 100.0
-            ema = self.score_tracker.update(miner_hotkey, combined_final)
+            # Log results and update current-round score
+            round_score = self.score_tracker.update(miner_hotkey, combined_final)
             scored_hotkeys.append(miner_hotkey)
-            print(f"   Score: {advanced_score:.2f}/100  EMA: {ema:.4f}", flush=True)
+            print(f"   Score: {advanced_score:.2f}/100  Round score: {round_score:.4f}", flush=True)
 
         except Exception as e:
             bt.logging.error(f"Error scoring miner {miner_hotkey[:16]}: {e}")
             print(f"   Error: {str(e)[:100]}", flush=True)
-            # Submit zero score on error
-            await self._submit_miner_score(round_id, miner_hotkey, None, 0)
-            self.score_tracker.update(miner_hotkey, 0.0)
-            scored_hotkeys.append(miner_hotkey)
+            bt.logging.warning(
+                f"Miner {miner_hotkey[:16]}: exception produced no valid local score; leaving for backfill"
+            )
 
     async def _finalize_round_scores(
         self,
@@ -910,7 +964,7 @@ class Validator:
         2. Fetch backfill scores for miners not personally covered.
         3. Feed each backfill score into ScoreTracker.update().
         4. Call record_round() ONCE with the complete set (personal + backfill).
-        5. Set chain weights from the full EMA state.
+        5. Set chain weights from the finalized current-round state.
         """
         # --- Step 1: Wait for scoring window + late-score grace to close ---
         score_grace_seconds = SCORE_GRACE_SECONDS
@@ -958,8 +1012,9 @@ class Validator:
                 await asyncio.sleep(wait_secs + 5)
 
         # --- Step 2: Fetch backfill scores from platform ---
-        # Build the complete set of hotkeys (personal + backfill) before calling
-        # record_round() so decay is applied correctly to truly absent miners only.
+        # Build the complete set of hotkeys (valid local scores + backfill)
+        # before calling record_round(). Failed local attempts are deliberately
+        # excluded so peer scores can fill them.
         all_scored_hotkeys = list(dict.fromkeys(scored_hotkeys))  # deduplicated, ordered
 
         if self.platform_client:
@@ -989,11 +1044,11 @@ class Validator:
                 # --- Step 3: Feed backfill into ScoreTracker ---
                 for entry in backfill_scores:
                     hk = entry.get("miner_hotkey")
-                    combined_final = entry.get("combined_final")
+                    combined_final = _valid_round_score(
+                        entry.get("combined_final"),
+                        label=f"backfill score for {hk[:16] if hk else '?'}...",
+                    )
                     if combined_final is None:
-                        bt.logging.warning(
-                            f"Skipping backfill for {hk[:16] if hk else '?'}...: missing AdvancedScorer combined_final"
-                        )
                         continue
                     if hk and hk not in set(all_scored_hotkeys):
                         self.score_tracker.update(hk, combined_final)
@@ -1037,8 +1092,17 @@ class Validator:
                 return False
 
         # --- Step 4: Record round with COMPLETE hotkey set ---
-        # This must happen after backfill so decay is only applied to miners
-        # with genuinely no score this round (not just ones we didn't cover).
+        # This must happen after backfill so only miners with a valid local or
+        # peer score participate in this round's ranking.
+        if not all_scored_hotkeys:
+            self.score_tracker.ema_scores.clear()
+            self.score_tracker.last_raw_scores.clear()
+            bt.logging.error(
+                f"Round {round_id}: no valid local or backfill scores; "
+                "skipping weight submission to avoid reusing stale round scores"
+            )
+            return False
+
         if all_scored_hotkeys:
             self.score_tracker.record_round(round_id, all_scored_hotkeys)
             bt.logging.info(
@@ -1047,7 +1111,12 @@ class Validator:
             )
 
         # --- Step 5: Set chain weights ---
-        await self._set_weights_after_round(round_id, submission_times)
+        weights_finalized = await self._set_weights_after_round(round_id, submission_times)
+        if not weights_finalized:
+            bt.logging.error(
+                f"Round {round_id}: weight finalization failed; round will be retried"
+            )
+            return False
         print(f"\n   Round {round_id} scoring complete", flush=True)
         return True
 
@@ -1165,38 +1234,24 @@ class Validator:
 
         try:
             if metrics is None:
-                # Failed run - submit zeros
-                result = await self.platform_client.submit_score(
-                    round_id=round_id,
-                    miner_hotkey=miner_hotkey,
-                    snp_f1=0.0,
-                    snp_precision=0.0,
-                    snp_recall=0.0,
-                    snp_tp=0,
-                    snp_fp=0,
-                    snp_fn=0,
-                    indel_f1=0.0,
-                    indel_precision=0.0,
-                    indel_recall=0.0,
-                    indel_tp=0,
-                    indel_fp=0,
-                    indel_fn=0,
-                    additional_metrics={
-                        "scorer": "Advanced",
-                        "score_schema_version": "0.1.1",
-                        "scoring_status": "failed",
-                        "advanced_score": 0.0,
-                        "combined_final": 0.0,
-                        "snp_final": 0.0,
-                        "indel_final": 0.0,
-                        "weighted_f1": 0.0,
-                        "overcall_penalty": 0.0,
-                    },
-                    validation_runtime_seconds=validation_runtime
+                bt.logging.warning(
+                    f"No score submitted for {miner_hotkey[:16]}: metrics missing"
                 )
+                return None
             else:
                 advanced_score = AdvancedScorer.compute_advanced_score(metrics)
-                combined_final = advanced_score / 100.0
+                combined_final = _valid_round_score(
+                    advanced_score / 100.0,
+                    label=f"platform submission for {miner_hotkey[:16]}...",
+                )
+                if combined_final is None:
+                    return None
+                if _is_zero_input_advanced_fingerprint(metrics, combined_final):
+                    bt.logging.warning(
+                        f"No score submitted for {miner_hotkey[:16]}: "
+                        "AdvancedScorer all-zero-input fingerprint"
+                    )
+                    return None
                 snp_final = metrics.get("f1_snp", 0.0)
                 indel_final = metrics.get("f1_indel", 0.0)
 
@@ -1239,7 +1294,7 @@ class Validator:
                 bt.logging.warning(f"Failed to submit score for {miner_hotkey[:16]}: {e}")
             return None
 
-    async def _set_weights_after_round(self, round_id: str, submission_times: dict = None):
+    async def _set_weights_after_round(self, round_id: str, submission_times: dict = None) -> bool:
         """Compute weight distribution, set on chain (if registered), and POST history to platform.
 
         Platform submission happens regardless of chain registration so the
@@ -1248,11 +1303,11 @@ class Validator:
         registration.
         """
         try:
-            # Compute weights over the miners we've actually scored.
+            # Compute weights over the miners finalized for this round.
             tracked_miners = list(self.score_tracker.ema_scores.keys())
             if not tracked_miners:
                 bt.logging.info("No miners scored — skipping weight assignment")
-                return
+                return False
 
             # Network reward params are authoritative. If the platform cannot
             # provide a complete policy, fail closed instead of silently using
@@ -1270,20 +1325,20 @@ class Validator:
                     "Network reward config unavailable — skipping weight "
                     "submission to avoid stale reward policy"
                 )
-                return
+                return False
             if not isinstance(network_cfg, dict):
                 bt.logging.error(
                     f"Network reward config has invalid shape: {network_cfg!r} — "
                     "skipping weight submission"
                 )
-                return
+                return False
             missing_policy_fields = sorted(required_policy_fields - set(network_cfg))
             if missing_policy_fields:
                 bt.logging.error(
                     "Network reward config missing required fields "
                     f"{missing_policy_fields} — skipping weight submission"
                 )
-                return
+                return False
             try:
                 burn_rate = float(network_cfg["burn_rate"])
                 burn_uid = int(network_cfg["burn_uid"])
@@ -1307,50 +1362,50 @@ class Validator:
                     f"Invalid network reward config {network_cfg}: {exc} — "
                     "skipping weight submission"
                 )
-                return
+                return False
             miner_budget = 1.0 - burn_rate
             if not 0.0 <= burn_rate <= 1.0:
                 bt.logging.error(f"Invalid burn_rate={burn_rate} — skipping weight submission")
-                return
+                return False
             if burn_uid < 0:
                 bt.logging.error(f"Invalid burn_uid={burn_uid} — skipping weight submission")
-                return
+                return False
             if not 0.0 <= winner_weight <= miner_budget:
                 bt.logging.error(
                     f"Invalid winner_weight={winner_weight} for "
                     f"miner_budget={miner_budget} — skipping weight submission"
                 )
-                return
+                return False
             if dust_top_n < 1:
                 bt.logging.error(f"Invalid dust_top_n={dust_top_n} — skipping weight submission")
-                return
+                return False
             if dust_decay < 0.0:
                 bt.logging.error(f"Invalid dust_decay={dust_decay} — skipping weight submission")
-                return
+                return False
             if canonical_min_validator_count < 1:
                 bt.logging.error(
                     f"Invalid canonical_min_validator_count={canonical_min_validator_count} "
                     "— skipping weight submission"
                 )
-                return
+                return False
             if canonical_min_validator_stake < 0.0:
                 bt.logging.error(
                     f"Invalid canonical_min_validator_stake={canonical_min_validator_stake} "
                     "— skipping weight submission"
                 )
-                return
+                return False
 
             if len(self.metagraph.hotkeys) <= burn_uid:
                 bt.logging.error(
                     f"Burn UID {burn_uid} unavailable in metagraph — skipping "
                     "weight submission to avoid renormalizing miner weights"
                 )
-                return
+                return False
 
             burn_hotkey = self.metagraph.hotkeys[burn_uid]
 
             # Build current chain recipient map before ranking. ScoreTracker can
-            # retain EMA for hotkeys that have since deregistered or become
+            # contain current-round hotkeys that have since deregistered or become
             # validators; those must not be eligible for winner/dust selection.
             # Burn hotkey is always included so any unallocated remainder can be
             # submitted explicitly instead of relying on SDK normalization.
@@ -1385,7 +1440,7 @@ class Validator:
                 sample = ", ".join(hk[:16] for hk in positive_dropped[:5])
                 bt.logging.warning(
                     f"Excluding {len(positive_dropped)} tracked hotkey(s) from "
-                    f"weight ranking because they are not current chain miner "
+                    f"round ranking because they are not current chain miner "
                     f"recipients (sample: {sample})"
                 )
 
@@ -1470,7 +1525,7 @@ class Validator:
                         "skipping weight submission. Check "
                         "/scoring/canonical-ranking."
                     )
-                    return
+                    return False
                 elif canonical_low_coverage:
                     bt.logging.error(
                         f"Canonical ranking has insufficient coverage for "
@@ -1483,7 +1538,7 @@ class Validator:
                         f"{canonical_min_validator_stake} TAO each). Skipping "
                         "weight submission to avoid validator divergence."
                     )
-                    return
+                    return False
                 elif canonical_ranking:
                     bt.logging.info(
                         f"Canonical ranking top={canonical_ranking[0][:16]}... "
@@ -1505,14 +1560,14 @@ class Validator:
                             "candidate — skipping weight submission to avoid "
                             "local-only winner selection."
                         )
-                        return
+                        return False
                 else:
                     bt.logging.error(
                         f"Canonical ranking unavailable for round "
                         f"{round_id} — skipping weight submission to avoid "
                         "validator divergence"
                     )
-                    return
+                    return False
 
             weights = self.score_tracker.get_winner_heavy_pruning_dust_weights(
                 chain_eligible_tracked_miners,
@@ -1535,16 +1590,14 @@ class Validator:
             # Log weight distribution (mode-aware)
             stats = self.score_tracker.get_stats()
             recipients = [hk for hk, w in weights.items() if w > 0]
-            is_warmup = stats['eligible_count'] == 0
-            mode_label = "warmup split" if is_warmup else "winner-heavy + pruning dust"
+            mode_label = "round-only winner-heavy + pruning dust"
             print(f"\n   Weight distribution ({mode_label}):", flush=True)
-            print(f"   Eligible: {stats['eligible_count']}/{len(tracked_miners)} miners "
-                  f"(need {stats['min_rounds_required']} rounds)", flush=True)
+            print(f"   Eligible current-round miners: {stats['eligible_count']}/{len(tracked_miners)}", flush=True)
             if recipients:
                 for r_hk in recipients:
                     r_w = weights[r_hk]
-                    r_ema = self.score_tracker.ema_scores.get(r_hk, 0)
-                    print(f"   {r_hk[:16]}... EMA={r_ema:.4f} weight={r_w:.6f}", flush=True)
+                    r_score = self.score_tracker.ema_scores.get(r_hk, 0)
+                    print(f"   {r_hk[:16]}... score={r_score:.4f} weight={r_w:.6f}", flush=True)
             else:
                 print(f"   No recipients — weights submission skipped (fail-closed)", flush=True)
 
@@ -1561,18 +1614,19 @@ class Validator:
                 )
                 bt.logging.info(f"Weight history submitted to platform for round {round_id}")
             except Exception as e:
-                bt.logging.warning(f"Failed to POST weight history: {e}")
+                bt.logging.error(f"Failed to POST weight history: {e}")
+                return False
 
             # Set weights on chain — only if this validator is registered. Skip in
             # preprod/demo mode but still keep the platform submission above.
             if not self.is_registered:
                 bt.logging.info("Skipping on-chain set_weights — not registered (demo mode)")
-                return
+                return True
 
             chain_weights = {hk: w for hk, w in weights.items() if hk in hotkey_to_uid}
             if not chain_weights:
                 bt.logging.warning("No tracked miners on chain — skipping chain set_weights")
-                return
+                return False
 
             chain_total = sum(chain_weights.values())
             missing_weight = 1.0 - chain_total
@@ -1589,14 +1643,24 @@ class Validator:
                     f"Chain weight vector exceeds 1.0 by {-missing_weight:.8f} "
                     "— skipping weight submission"
                 )
-                return
+                return False
 
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self.set_weights, chain_weights, hotkey_to_uid)
+            chain_success = await loop.run_in_executor(
+                None,
+                self.set_weights,
+                chain_weights,
+                hotkey_to_uid,
+            )
+            if not chain_success:
+                bt.logging.error(f"Round {round_id}: chain set_weights failed")
+                return False
+            return True
 
         except Exception as e:
             bt.logging.error(f"Error in _set_weights_after_round: {e}")
             bt.logging.error(traceback.format_exc())
+            return False
 
     def set_weights(self, weights_by_hotkey: dict = None, hotkey_to_uid: dict = None, retry_count: int = 0):
         """Set weights on the blockchain.
@@ -1648,12 +1712,12 @@ class Validator:
             total = sum(miner_weights)
             if total <= 0:
                 # Fail closed — never silently distribute equal weights.
-                # Zero-sum weights indicate a scoring failure or no eligible miners
-                # with positive EMA. Submitting equal weights would leak emissions.
+                # Zero-sum weights indicate a scoring failure or no current-round
+                # miners with positive scores. Submitting equal weights would leak emissions.
                 bt.logging.error(
                     "WEIGHT SAFETY: all computed weights are zero — skipping "
                     "weight submission to prevent unintended equal distribution. "
-                    "This may indicate a scoring failure or all miners having zero EMA."
+                    "This may indicate a scoring failure or all miners having zero round scores."
                 )
                 return False
             if abs(total - 1.0) > 1e-6:
@@ -1818,7 +1882,8 @@ class Validator:
                 print(f"   Platform connection error: {e} - falling back to standalone mode", flush=True)
                 self.use_platform = False
 
-        # Restart recovery: rebuild ScoreTracker from platform DB
+        # Restart recovery: platform may return legacy EMA/history payloads,
+        # but the round-only tracker starts fresh by design.
         if self.use_platform and self.platform_client:
             try:
                 print(f"   Recovering state from platform...", flush=True)
@@ -1831,8 +1896,7 @@ class Validator:
                 self.scored_rounds = set(state.get("scored_round_ids", []))
 
                 print(
-                    f"   State recovered: {len(self.score_tracker.ema_scores)} miners, "
-                    f"{len(self.scored_rounds)} scored rounds",
+                    f"   State recovered: {len(self.scored_rounds)} scored rounds",
                     flush=True,
                 )
             except Exception as e:
@@ -1854,8 +1918,8 @@ class Validator:
 
                     if step % VALIDATOR_CONFIG["scoring_interval"] == 0:
                         stats = self.score_tracker.get_stats()
-                        bt.logging.info(f"Performance stats - Top EMA: {stats['top_ema']:.4f}, "
-                                       f"Eligible: {stats['eligible_count']}/{stats['total_miners_tracked']}, "
+                        bt.logging.info(f"Performance stats - Top round score: {stats['top_round_score']:.4f}, "
+                                       f"Eligible current-round miners: {stats['eligible_count']}/{stats['total_miners_tracked']}, "
                                        f"Rounds tracked: {stats['rounds_tracked']}")
 
                     # Sync metagraph every round to catch new/removed miners quickly

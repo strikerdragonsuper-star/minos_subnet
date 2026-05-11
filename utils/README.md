@@ -53,7 +53,7 @@ score = AdvancedScorer.compute_advanced_score(results)
 
 ### 2. Weight Tracking (weight_tracking.py)
 
-**Purpose:** Tracks miner performance over time with EMA smoothing and winner-heavy pruning dust weights.
+**Purpose:** Tracks current-round miner scores, recent-window participation eligibility, and winner-heavy pruning dust weights.
 
 **Main Class:** `ScoreTracker`
 
@@ -78,10 +78,10 @@ weights = tracker.get_winner_heavy_pruning_dust_weights(
 
 **Algorithm:**
 
-1. **EMA Smoothing:**
-2. **Winner-Heavy Pruning Dust:**
-3. **Participation Gating:** 
-4. **Normalization:** 
+1. **Round Score:** current-round AdvancedScorer `combined_final` only.
+2. **Participation Gating:** 10 valid scored rounds in the last 20 required; the current round counts.
+3. **Winner-Heavy Pruning Dust:** eligible rank #1 gets winner weight, ranks #2-#10 split dust.
+4. **Burn Remainder:** validator sends unallocated weight to the burn UID.
 
 ### 3. File Utils (file_utils.py)
 

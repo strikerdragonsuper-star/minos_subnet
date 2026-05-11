@@ -113,9 +113,9 @@ A validator uses miners config file and selected hyperparameters to run the vari
 
 3. **Backfill and Update Weights**
    - After scoring window closes, fetch peer scores for miners not personally covered
-   - Track personal and backfilled scores with EMA (exponential moving average)
+   - Track personal and backfilled current-round AdvancedScorer scores
    - Record round participation once with the complete personal + backfilled hotkey set
-   - Compute warmup split or winner-heavy pruning dust weights from EMA
+   - Compute winner-heavy pruning dust weights from eligible current-round scores
    - Submit weight history to the platform for aggregation/dashboarding
    - Submit weights to Bittensor blockchain only when the validator hotkey is registered
 
@@ -162,8 +162,8 @@ python -m neurons.validator
 | `PLATFORM_URL` | https://api.theminos.ai | Platform API URL |
 | `PLATFORM_TIMEOUT` | 60 | Platform API request timeout (seconds) |
 | `STORAGE_PRIMARY_BACKEND` | hippius | Storage preference: `hippius` tries Hippius SN75 first (Bittensor decentralized, recommended). `aws_s3` reverses the order. |
-| `EMA_ALPHA` | 0.1 | EMA smoothing factor (higher = more weight on recent scores) |
-| `EMA_DECAY_FACTOR` | 0.95 | EMA decay multiplier applied per missed round |
+| `MIN_PARTICIPATION_ROUNDS` | 10 | Valid scored rounds required inside the recent eligibility window |
+| `PARTICIPATION_WINDOW` | 20 | Recent finalized rounds considered for eligibility |
 | `SCORING_THREADS` | auto | Override: threads per scoring Docker job. Auto-tuned from cores (clamped 2–8) |
 | `SCORING_MEMORY_GB` | 16 | Override: memory per scoring Docker job. **Below 16 OOM-crashes DeepVariant** |
 | `MINOS_VALIDATOR_CONCURRENCY` | auto | Override: concurrent miner jobs. Auto = `min(cores//threads, ram_gb//16, 8)` |
@@ -203,7 +203,7 @@ python -m neurons.validator
 │                          VALIDATOR                               │
 │  5. Re-run each miner's tool config locally                      │
 │  6. Score with hap.py against merged truth                       │
-│  7. Update EMA scores, winner-heavy pruning dust weights         │
+│  7. Score current round and compute pruning dust weights         │
 │  8. Submit weights to blockchain                                 │
 └──────────────────────────┬──────────────────────────────────────┘
                            ▼
@@ -216,11 +216,13 @@ python -m neurons.validator
 
 ### Weight Distribution
 
-Weights are assigned in two phases:
-
-**Warmup** (before any miner has scored in ≥10 rounds): the non-burn miner budget is split among the top 3 active miners with positive EMA — 50% to 1st, 30% to 2nd, 20% to 3rd, renormalized if fewer than three qualify. Scores within 0.5% of each other are tiebroken by earliest submission time.
-
-**Normal** (once any miner reaches eligibility): validators burn 87%, give the top eligible miner 10%, and split the remaining 3% across eligible ranks #2 through #10 using ranked pruning dust. Eligibility requires scoring in at least 10 of the last 20 rounds; ineligible miners receive 0 weight in normal mode. Absent miners' EMA decays each round they miss (×0.95). Tiebreaker: earliest submission timestamp (applied only at floating-point tolerance).
+Validators burn 87%, give the top eligible miner 10%, and split the remaining
+3% across eligible ranks #2 through #10 using ranked pruning dust. Eligibility
+requires at least 10 valid scored rounds in the last 20 finalized rounds, and
+the current round counts toward that threshold. Eligible miners are ranked only
+by the current round's AdvancedScorer score; ineligible miners receive 0
+weight. Tiebreaker: earliest submission timestamp (applied only at
+floating-point tolerance).
 
 ## Requirements
 

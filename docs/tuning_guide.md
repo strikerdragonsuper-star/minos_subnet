@@ -25,18 +25,18 @@ Validators compare your VCF output against a truth VCF using **hap.py** (the GA4
 
 **Quality** checks biological plausibility. For WGS data, Ti/Tv should be around 2.0 and Het/Hom around 1.5. Large deviations indicate systematic errors in your calls.
 
-### EMA Smoothing and Winner-Takes-All
+### Round Scores and Winner Weights
 
-The AdvancedScorer outputs a raw score on a 0–100 scale. This is normalized to 0–1 before feeding into the EMA (so a raw score of 85/100 becomes 0.85 in EMA). Your EMA is smoothed with alpha = 0.1:
+The AdvancedScorer outputs a raw score on a 0–100 scale. Validators normalize that to a 0–1 current-round score, so a raw score of 85/100 becomes 0.85. Miner rankings are round-only: each round is a separate challenge, and the current-round score decides the paid ranks for that round.
 
-- A single bad round does not destroy you, but persistent low scores will drag your EMA down.
-- It takes roughly 10 rounds for the EMA to mostly reflect your current performance.
-- Missing rounds applies a decay factor of 0.95 per missed round to your EMA.
-- When reading logs: `Score: 85.00/100  EMA: 0.0850` is a typical first-round result with alpha = 0.1. The score is 0–100; the EMA is 0–1 and moves gradually.
+- A single bad round costs that round, not future rounds.
+- There is no EMA decay for missed rounds in the current scoring path.
+- Eligibility still depends on recent participation: miners must have valid positive scores in at least 10 of the last 20 rounds.
+- When reading logs: `Score: 85.00/100` means the current-round score is 0.85 after normalization.
 
-**Warmup phase** (until any miner has participated in 10+ rounds): the non-burn miner budget is split among the top 3 active miners by EMA — 50% to 1st, 30% to 2nd, 20% to 3rd, renormalized if fewer than three active miners have positive EMA.
+**Before eligibility:** miners receive 0 weight until they have enough recent valid scored rounds. Validators keep the unassigned budget in burn rather than paying ineligible miners.
 
-**Normal phase** (after warmup): **winner-heavy with pruning dust** among eligible miners — validators burn 87%, give rank #1 10%, and split the remaining 3% across eligible ranks #2 through #10 with ranked decay. Ineligible miners and ranks below the dust cutoff get 0.
+**After eligibility:** **winner-heavy with pruning dust** among eligible miners — validators burn 87%, give rank #1 10%, and split the remaining 3% across eligible ranks #2 through #10 with ranked decay. Ineligible miners and ranks below the dust cutoff get 0.
 
 Consistency matters as much as peak performance.
 
@@ -46,7 +46,7 @@ This is the most common question for new miners. There are three distinct causes
 
 **1. You are not eligible yet (most likely).** Eligibility requires participating in **at least 10 of the last 20 rounds**. With ~20 rounds per day, a fresh miner needs roughly 12 hours of continuous uptime before they can earn any weight, even with perfect scores. During this time you appear in validator logs but receive 0 weight. This is expected.
 
-**2. You are eligible but outside the paid ranks.** Once eligible, the top miner gets the main 10% miner weight and eligible ranks #2 through #10 split the pruning dust. If your EMA is below the paid cutoff, you get 0. The fix is to score better — see Section 4 (Tuning Strategy).
+**2. You are eligible but outside the paid ranks.** Once eligible, the top miner gets the main 10% miner weight and eligible ranks #2 through #10 split the pruning dust. If your current-round score ranks below the paid cutoff, you get 0. The fix is to score better — see Section 4 (Tuning Strategy).
 
 **3. You are submitting but the score is 0.** Causes: wrong reference build, malformed VCF (multi-sample, missing index), tool config rejected by the parameter whitelist, or a Docker error. Check your logs for the line `Score: 0.00/100`. If you see it, the variant call ran but produced no usable output. If you do not see a score line at all, your submission never made it to the scoring phase — check the platform connectivity / round timing.
 
@@ -54,13 +54,13 @@ A useful sanity check: if your logs show `Submitted config for round 2026-XX-XXT
 
 ### What If I Restart Mid-Round?
 
-The EMA state is recovered from the platform on startup, so your historical performance is not lost. Already-scored miners in the current round are skipped on the next pass — no double-scoring or wasted compute. There is no manual recovery step needed.
+Recent participation state is recovered from the platform on startup, so eligibility is not lost during a restart. Already-scored miners in the current round are skipped on the next pass — no double-scoring or wasted compute. There is no manual recovery step needed.
 
 ---
 
 ## 2. Choosing Your Variant Caller
 
-Four tools are supported. Pick based on your hardware and willingness to tune.
+Three active tools are supported. Pick based on your hardware and willingness to tune.
 
 | Tool                  | Accuracy | Speed   | Tunability | Best For                        |
 |-----------------------|----------|---------|------------|---------------------------------|
@@ -143,7 +143,7 @@ The FP rate penalty ramps steeply once you exceed the dynamic threshold. If your
 
 ### Step 5: Test Locally First
 
-Use demo mode to run test jobs locally before committing to live rounds. A bad config can tank your EMA for 10+ rounds due to the smoothing.
+Use demo mode to run test jobs locally before committing to live rounds. A bad config can cost the current round and may fail to count toward eligibility if it produces no valid positive score.
 
 ### The Core Tradeoff
 
@@ -168,7 +168,7 @@ The scoring weights (60% F1, 15% completeness, 15% FP) mean you want to lean sli
 | 40-60   | Something is suboptimal. Check tool parameters and Docker image.  |
 | Below 40| Likely a configuration error. See Common Mistakes below.          |
 
-The genomic region (chr20, 5MB windows from 10MB-55MB) varies per round, so some score variance is normal. Focus on your EMA trend, not individual rounds.
+The genomic region (chr20, 5MB windows from 10MB-55MB) varies per round, so some score variance is normal. Focus on your current-round score trend and consistency across regions.
 
 ---
 
@@ -180,11 +180,11 @@ The genomic region (chr20, 5MB windows from 10MB-55MB) varies per round, so some
 
 **Not using PCR-free mode for GATK.** GIAB donors use PCR-free library prep. Running GATK with the default `CONSERVATIVE` PCR indel model introduces unnecessary indel filtering. Set `pcr_indel_model=NONE`.
 
-**Timeout from too few threads.** While you cannot control thread count directly (it is an infrastructure parameter), make sure your Docker environment has enough resources. If your job times out before the submission window closes, you get a zero for that round — devastating for your EMA.
+**Timeout from too few threads.** While you cannot control thread count directly (it is an infrastructure parameter), make sure your Docker environment has enough resources. If your job times out before the submission window closes, you get no valid positive score for that round and may miss an eligibility count.
 
 **Ignoring Ti/Tv ratio.** A Ti/Tv ratio significantly below 2.0 for WGS usually means you are calling many false SNPs. Check your quality filters rather than accepting a low Quality component score.
 
-**Changing too many parameters at once.** With EMA smoothing at alpha=0.1, it takes many rounds to see the true effect of changes. Methodical single-parameter tuning is the only reliable approach.
+**Changing too many parameters at once.** Because each region is a different challenge, changing several knobs at once makes it hard to tell what helped. Methodical single-parameter tuning is the only reliable approach.
 
 ---
 
@@ -237,4 +237,4 @@ min_mapping_quality=10
 3. Set PCR-free mode if using GATK.
 4. Tune one parameter at a time, watching your per-component scores.
 5. Keep your FP rate low — the penalty ramps steeply past the threshold.
-6. Be patient — EMA smoothing means results take rounds to stabilize.
+6. Be patient — eligibility takes 10 valid scored rounds, and region-to-region variance is normal.
