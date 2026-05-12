@@ -897,7 +897,7 @@ class HappyScorer:
             return self._get_zero_scores()
 
     def _get_zero_scores(self) -> Optional[Dict[str, float]]:
-        """Fail closed so the validator submits explicit combined_final=0.0."""
+        """Return no score so the validator can seek peer backfill."""
         return None
 
 

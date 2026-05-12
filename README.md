@@ -87,7 +87,7 @@ minos_subnet/
 │   └── tool_params.py        # Parameter definitions and validation
 ├── utils/                    # Genomics utility modules
 │   ├── scoring.py            # hap.py Docker runner + AdvancedScorer
-│   ├── weight_tracking.py    # EMA score tracker + winner-heavy pruning dust weights
+│   ├── weight_tracking.py    # Round score tracker + winner-heavy pruning dust weights
 │   ├── platform_client.py    # Authenticated API client (miner + validator)
 │   ├── subset_scoring.py     # Subset scoring helpers (assignments, deadlines)
 │   ├── config_loader.py      # Tool config file parser
@@ -95,7 +95,7 @@ minos_subnet/
 │   ├── file_utils.py         # SHA256-verified file download + caching
 │   └── README.md             # Utils documentation
 ├── base/                     # Core subnet config
-│   └── genomics_config.py    # Central config (Docker images, timeouts, EMA params)
+│   └── genomics_config.py    # Central config (Docker images, timeouts, scoring params)
 ├── configs/                  # Miner-tunable quality parameters
 │   ├── gatk.conf
 │   ├── deepvariant.conf
@@ -107,11 +107,14 @@ minos_subnet/
 │   └── hap_py_docker.md      # hap.py Docker image reference
 ├── scripts/                  # Developer tools
 │   ├── verify.sh             # Pre-flight environment check
-│   └── demo.sh               # End-to-end demo runner
+│   ├── demo.sh               # End-to-end demo runner
+│   └── auto_update.sh        # PM2 auto-update worker used by enable_auto_update.sh
 ├── tests/                    # Unit and integration tests
 │   ├── conftest.py
 │   └── test_*.py             # Tests for scoring, config, platform client, etc.
 ├── install.sh                # Installer (full setup or update mode)
+├── enable_auto_update.sh     # Enable safe git pull + PM2 restart updates
+├── disable_auto_update.sh    # Stop the PM2 auto-updater
 ├── setup.py                  # Interactive setup wizard
 ├── start-miner.sh            # Start miner (with inline wallet setup)
 ├── start-validator.sh        # Start validator (with inline wallet setup)
@@ -180,6 +183,30 @@ pm2 start ecosystem.miner.config.js
 ```
 
 Useful commands: **`pm2 status`**, **`pm2 logs minos-validator`** / **`pm2 logs minos-miner`**, **`pm2 save`** (persist process list after reboot — pair with **`pm2 startup`** per PM2 docs). The interactive setup wizard can also generate **`ecosystem.<role>.config.js`** when you choose the PM2 process-manager option.
+
+### Automatic Updates with PM2
+
+If your miner or validator already runs under PM2, you can enable safe automatic git pulls and PM2 restarts:
+
+```bash
+./enable_auto_update.sh
+```
+
+The setup script finds likely PM2 miner/validator processes, asks you to confirm the exact process, then starts a small PM2 updater named **`minos-auto-update`**.
+
+Safety rules:
+
+- Local git changes or untracked files make the updater skip the pull.
+- Only fast-forward git updates are applied.
+- Only the PM2 process you confirmed is restarted.
+- The selected repo, branch, and PM2 process are saved in `~/.minos/auto_update.env`.
+
+Useful commands:
+
+```bash
+pm2 logs minos-auto-update
+./disable_auto_update.sh
+```
 
 ### Updating
 
@@ -381,8 +408,8 @@ The Minos Platform is a hosted service at `https://api.theminos.ai` that handles
 | `POST /v2/get-assignment`       | Validator | Get primary/secondary miner scoring assignment |
 | `POST /v2/submit-score`         | Validator | Submit per-miner scores                        |
 | `POST /v2/get-backfill-scores`  | Validator | Fetch peer scores after scoring window closes  |
-| `POST /v2/submit-weight-history`| Validator | Submit EMA scores and weights after round      |
-| `POST /v2/get-validator-state`  | Validator | Recover EMA state after validator restart       |
+| `POST /v2/submit-weight-history`| Validator | Submit round scores, eligibility, and weights   |
+| `POST /v2/get-validator-state`  | Validator | Recover round score state after validator restart |
 
 ### Storage Backends
 
@@ -418,28 +445,23 @@ Validators run each miner's tool config and score the resulting VCF from that ag
 | FP Rate      | 15%    |
 | Quality      | 10%    |
 
-### EMA Weight Tracking
+### Round Score Tracking
 
-The raw AdvancedScorer output (0–100) is normalized to a 0–1 scale before feeding into the EMA. Scores are smoothed over time using Exponential Moving Average:
+The raw AdvancedScorer output (0-100) is normalized to a 0-1 scale and used as the miner's score for that round. Winners are selected from the current round's valid Advanced Score only; historical score carryover is not used.
 
 ```python
-# AdvancedScorer returns 0-100, normalized to 0-1 for EMA
+# AdvancedScorer returns 0-100, normalized to 0-1 for round scoring
 combined_final = advanced_score / 100.0
-# EMA starts at 0; first round yields 10% of first score
-ema = (1 - alpha) * ema + alpha * combined_final
-# alpha = 0.1 (10% weight on new scores)
-# Example: raw score 85/100 → combined_final 0.85 → EMA ~0.085 after first round
+current_score = combined_final
 ```
+
+Only finite scores where `0 < current_score <= 1.0` are eligible for ranking. Rounds with no valid local or backfilled scores fail closed and do not reuse previous-round scores. The validator and platform also filter the synthetic all-zero input fingerprint around 0.25 so empty or invalid calls cannot become winners.
 
 ### Weight Distribution
 
-Weights are assigned in two phases:
+Validators burn 87% of their weight, give the top eligible current-round miner 10%, and split the remaining 3% as ranked pruning dust across eligible ranks #2 through #10 using 0.8 geometric weighting. If fewer dust recipients exist, that 3% is renormalized across the available ranks; if no dust recipients exist, unused dust is sent to burn.
 
-**Warmup** (before any miner has reached eligibility): the non-burn miner budget is split among the top 3 active miners by EMA score — 50% to 1st, 30% to 2nd, 20% to 3rd. If fewer than three active miners have positive EMA, the split is renormalized across the active positive-score set.
-
-**Normal** (once any miner reaches eligibility): validators burn 87% of their weight, give the top eligible miner 10%, and split the remaining 3% as ranked pruning dust across eligible ranks #2 through #10 using a 0.8 geometric decay. If fewer dust recipients exist, that 3% is renormalized across the available ranks; if no dust recipients exist, unused dust is sent to burn. Eligibility requires scoring in at least 10 of the last 20 rounds. Miners below the participation threshold receive 0 weight in normal mode. Absent miners' EMA decays each round they miss (×0.95), preventing stale scores from holding weight indefinitely.
-
-In the warmup phase, miners with scores within 0.5% of each other are tiebroken by earliest config submission time. In the normal phase, tiebreaks only apply when EMA scores are essentially identical (floating-point tolerance).
+Eligibility requires scoring in at least 10 of the last 20 rounds, including the current round. Miners below the participation threshold receive 0 weight until they qualify. Close current-round ties use deterministic round data from the validator/platform flow; historical scores are not part of the ranking.
 
 ---
 
@@ -458,7 +480,7 @@ In the warmup phase, miners with scores within 0.5% of each other are tiebroken 
 | Round skipped, "<10min left"  | Submitted too late                         | Miner needs ≥10 min remaining to start a round. Check clock skew (`timedatectl`) and platform connectivity speed |
 | Reference download stuck/slow | Platform redirect or transient network     | Setup retries once automatically. If it still fails, re-run `bash install.sh --update-only`                      |
 | Validator: "no scoring rounds"| Round still in submission window           | Validators only score AFTER the submission window closes. Wait for the next tempo boundary                       |
-| Earning 0 weight as miner     | Not eligible yet, or eligible but not the top EMA miner | Need >=10 of last 20 rounds participated, then a higher EMA than competitors. See [tuning_guide](docs/tuning_guide.md) |
+| Earning 0 weight as miner     | Not eligible yet, no valid current score, or outside the top current-round winners | Need >=10 of last 20 rounds participated, then a stronger current-round Advanced Score. See [tuning_guide](docs/tuning_guide.md) |
 
 ### Logs
 
